@@ -8,15 +8,20 @@ from openpyxl.styles import PatternFill
 
 # 1. 파일명 규칙 정제 함수
 
-# 발음 파일명에서 사용하지 않을 줄임말 -> 원래 표현 매핑
-# (긴 패턴을 먼저 처리해야 짧은 패턴에 의해 잘못 치환되지 않음)
-def expand_abbreviations(text):
+# vocabulary 및 발음 파일명 모두에 적용: sb/sth 계열 줄임말 풀어쓰기
+# (sb/sth처럼 함께 붙어있는 경우를 먼저 처리해야 단독 sb, sth 규칙에 의해 잘못 치환되지 않음)
+def expand_sb_sth(text):
     t = text
     t = re.sub(r'\bsb\s*/\s*sth\b', 'something', t)   # sb/sth -> something
-    t = re.sub(r'\bV-ing\b', 'ing', t)                # V-ing -> ing
-    t = re.sub(r'\bto\s+V\b', 'to', t)                # to V -> to
     t = re.sub(r'\bsb\b', 'somebody', t)              # sb -> somebody
     t = re.sub(r'\bsth\b', 'something', t)            # sth -> something
+    return t
+
+# 발음 파일명에서만 추가로 사용하지 않을 줄임말 -> 원래 표현 매핑
+def expand_abbreviations(text):
+    t = expand_sb_sth(text)
+    t = re.sub(r'\bV-ing\b', 'ing', t)                # V-ing -> ing
+    t = re.sub(r'\bto\s+V\b', 'to', t)                # to V -> to
     return t
 
 def clean_filename(text):
@@ -67,7 +72,7 @@ def parse_word_content(docx_file):
         match = entry_pattern.match(line)
 
         if match:
-            raw_word = match.group(1).strip()
+            raw_word = expand_sb_sth(match.group(1).strip())
 
             # "Syn: xxx" 처럼 단어 없이 유의어만 있는 줄은 아래 유의어 처리 블록으로 넘김
             if not keyword_only_pattern.match(raw_word):
@@ -143,7 +148,7 @@ def parse_pdf_content(pdf_file):
         # 번호 + 단어: 뜻 [Syn/Ant: 유의어] 추출
         match = entry_pattern.match(line)
         if match:
-            raw_word = match.group(1).strip()
+            raw_word = expand_sb_sth(match.group(1).strip())
             rest = match.group(2).strip()
 
             syn_match = syn_pattern.search(rest)
