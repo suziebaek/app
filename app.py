@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from docx import Document
+import pdfplumber
 import io
 import re
 from openpyxl.styles import PatternFill
@@ -66,6 +67,68 @@ def parse_word_content(docx_file):
 
     return data, raw_texts
 
+# 2-1. PDF 파싱 함수
+def parse_pdf_content(pdf_file):
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
+
+    data = []
+    raw_texts = []
+
+    current_chapter_num = 1
+    current_week_title = "Week01/"
+    current_week_num = 1
+
+    # PDF 텍스트 추출 시 "01 word: 뜻   Syn: xxx" 처럼 번호가 마침표 없이
+    # 붙는 형태와, 뜻과 Syn/Ant 사이가 한 칸 공백으로만 구분되는 경우가 많아
+    # 워드용 정규식과는 별도의 패턴을 사용합니다.
+    entry_pattern = re.compile(r'^\d{1,2}\s+([^:]+):\s*(.*)$')
+    syn_pattern = re.compile(r'\b(Syn|Ant)\s*:\s*(.+)$')
+
+    for line in lines:
+        raw_texts.append(line)
+
+        # 챕터 감지 (Week 번호 연동)
+        chapter_match = re.search(r'(?i)Chapter\s*(\d+)', line)
+        if chapter_match:
+            current_week_num = int(chapter_match.group(1))
+            current_week_title = f"Week{current_week_num:02d}/"
+            current_chapter_num = 1
+            continue
+
+        # 번호 + 단어: 뜻 [Syn/Ant: 유의어] 추출
+        match = entry_pattern.match(line)
+        if match:
+            raw_word = match.group(1).strip()
+            rest = match.group(2).strip()
+
+            syn_match = syn_pattern.search(rest)
+            if syn_match:
+                meaning = rest[:syn_match.start()].strip()
+                extra_info = syn_match.group(2).strip()
+            else:
+                meaning = rest
+                extra_info = ""
+
+            if re.search(r'[가-힣]', meaning):
+                sound_file = clean_filename(raw_word)
+
+                data.append({
+                    "lesson_title": current_week_title,
+                    "lesson_order_seq": current_week_num,
+                    "page_order_seq": current_chapter_num,
+                    "vocabulary": raw_word,
+                    "vocabulary_kor": meaning,
+                    "vocabulary_sound": sound_file,
+                    "vocabulary_excep": extra_info,
+                    "prompt": ""
+                })
+                current_chapter_num += 1
+
+    return data, raw_texts
+
 # --- 3. Streamlit UI (여기서 변수가 정의됩니다) ---
 st.set_page_config(page_title="최종 단어 변환기", layout="wide")
 st.title("📑 주차 연동 및 색상 지정 시스템")
@@ -83,11 +146,16 @@ with st.sidebar:
     show_debug = st.checkbox("디버그 모드", value=False)
 
 # 중요: 여기서 uploaded_file 변수가 정의됩니다!
-uploaded_file = st.file_uploader("워드 파일(.docx)을 업로드하세요", type=["docx"])
+uploaded_file = st.file_uploader("워드(.docx) 또는 PDF(.pdf) 파일을 업로드하세요", type=["docx", "pdf"])
 
 # 변수가 정의된 이후에 사용합니다.
 if uploaded_file is not None:
-    parsed_data, raw_texts = parse_word_content(uploaded_file)
+    file_ext = uploaded_file.name.lower().rsplit(".", 1)[-1]
+
+    if file_ext == "pdf":
+        parsed_data, raw_texts = parse_pdf_content(uploaded_file)
+    else:
+        parsed_data, raw_texts = parse_word_content(uploaded_file)
     
     if parsed_data:
         df = pd.DataFrame(parsed_data)
