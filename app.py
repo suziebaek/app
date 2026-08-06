@@ -32,7 +32,7 @@ def clean_filename(text):
     return text + ".mp3"
 
 # 챕터 표기 감지: "Chapter 1", "CHAPTER 01", "CH01", "CH02" 등 여러 형식 지원
-CHAPTER_LINE_PATTERN = re.compile(r'(?i)^(?:chapter|ch)\.?\s*0*(\d+)\s*$')
+CHAPTER_LINE_PATTERN = re.compile(r'(?i)^(?:chapter|ch)\.?\s*0*(\d+)\b')
 
 def detect_chapter_number(line):
     m = CHAPTER_LINE_PATTERN.match(line.strip())
@@ -111,6 +111,99 @@ def parse_word_content(docx_file):
             if data:
                 first_extra = re.split(r'\s{2,}', extra_info)[0].strip()
                 data[-1]["vocabulary_excep"] = first_extra
+
+    return data, raw_texts
+
+# 2-0. 워드 파싱 함수 (용어집/Glossary 형식)
+# "word / 뜻 / (부가 설명) / syn: ... / ant: ... / 예문 / 활용 표현" 처럼
+# 각 항목이 한 줄에 한 요소씩, 콜론으로 단어-뜻이 묶이지 않고 여러 줄에 나뉘어
+# 있는 문서 형식을 지원합니다. 단어 줄은 "그 줄 자체엔 한글이 없고, 바로 다음
+# 줄에는 한글이 있다"는 특징으로 판별합니다.
+def _has_korean(text):
+    return bool(re.search(r'[가-힣]', text))
+
+def _is_glossary_word_start(lines, idx):
+    if idx >= len(lines):
+        return False
+    line = lines[idx]
+    if re.match(r'(?i)^(syn|ant|atn|유의어|반의어)\s*:', line):
+        return False
+    if _has_korean(line):
+        return False
+    if detect_chapter_number(line) is not None:
+        return False
+    if idx + 1 >= len(lines):
+        return False
+    return _has_korean(lines[idx + 1])
+
+def parse_word_content_glossary_style(docx_file):
+    doc = Document(docx_file)
+
+    # 워드 안에서 줄바꿈(Shift+Enter)으로 나뉜 줄까지 모두 개별 라인으로 펼침
+    raw_lines = []
+    for p in doc.paragraphs:
+        if not p.text.strip():
+            continue
+        for sub in p.text.split("\n"):
+            sub = sub.strip()
+            if sub:
+                raw_lines.append(sub)
+
+    data = []
+    raw_texts = list(raw_lines)
+
+    current_chapter_num = 1
+    current_week_title = "Week01/"
+    current_week_num = 1
+
+    tail_keyword_pattern = re.compile(r'(?i)^(syn|ant|atn|유의어|반의어)\s*:\s*(.*)$')
+
+    i = 0
+    n = len(raw_lines)
+    while i < n:
+        line = raw_lines[i]
+
+        # 챕터 감지 (Week 번호 연동)
+        chapter_num = detect_chapter_number(line)
+        if chapter_num is not None:
+            current_week_num = chapter_num
+            current_week_title = f"Week{current_week_num:02d}/"
+            current_chapter_num = 1
+            i += 1
+            continue
+
+        if _is_glossary_word_start(raw_lines, i):
+            raw_word = expand_sb_sth(line)
+            meaning = raw_lines[i + 1].strip()
+
+            # 단어 다음, 다음 단어(혹은 챕터)가 나오기 전까지의 구간에서
+            # 첫 번째로 등장하는 syn/ant 값을 유의어/반의어로 채택
+            extra_info = ""
+            j = i + 2
+            while j < n and not _is_glossary_word_start(raw_lines, j) and detect_chapter_number(raw_lines[j]) is None:
+                tail_match = tail_keyword_pattern.match(raw_lines[j])
+                if tail_match and not extra_info:
+                    extra_info = tail_match.group(2).strip()
+                j += 1
+
+            if _has_korean(meaning):
+                sound_file = clean_filename(raw_word)
+                data.append({
+                    "lesson_title": current_week_title,
+                    "lesson_order_seq": current_week_num,
+                    "page_order_seq": current_chapter_num,
+                    "vocabulary": raw_word,
+                    "vocabulary_kor": meaning,
+                    "vocabulary_sound": sound_file,
+                    "vocabulary_excep": extra_info,
+                    "prompt": ""
+                })
+                current_chapter_num += 1
+
+            i = j
+            continue
+
+        i += 1
 
     return data, raw_texts
 
@@ -203,6 +296,10 @@ if uploaded_file is not None:
         parsed_data, raw_texts = parse_pdf_content(uploaded_file)
     else:
         parsed_data, raw_texts = parse_word_content(uploaded_file)
+        # 기본 형식(단어: 뜻)으로 하나도 못 찾으면, 용어집(Glossary) 형식으로 재시도
+        if not parsed_data:
+            uploaded_file.seek(0)
+            parsed_data, raw_texts = parse_word_content_glossary_style(uploaded_file)
     
     if parsed_data:
         df = pd.DataFrame(parsed_data)
