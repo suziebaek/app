@@ -4,6 +4,8 @@ from docx import Document
 import pdfplumber
 import io
 import re
+import zipfile
+import datetime
 from openpyxl.styles import PatternFill
 
 # 1. 파일명 규칙 정제 함수
@@ -50,7 +52,16 @@ def parse_word_content(docx_file):
     current_week_title = "Week01/"
     current_week_num = 1
     
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    paragraphs = []
+    for p in doc.paragraphs:
+        if not p.text.strip():
+            continue
+        # Shift+Enter(줄바꿈)로 한 문단 안에 여러 줄(예: "word: 뜻" 다음 줄에 "Syn: ...")이
+        # 들어있는 경우를 대비해 문단 내부의 줄바꿈 기준으로도 분리
+        for sub in p.text.split("\n"):
+            sub = sub.strip()
+            if sub:
+                paragraphs.append(sub)
 
     # 번호는 "1. word" (마침표)와 "01  word" (공백 2칸) 형식을 모두 지원
     entry_pattern = re.compile(r'^(?:\d+[\.\s]+)?([^:]+):\s*(.*)$')
@@ -269,6 +280,28 @@ def parse_pdf_content(pdf_file):
 
     return data, raw_texts
 
+# 4. 엑셀 생성 헬퍼 (지정된 컬럼에 회색 배경 적용)
+def build_excel_bytes(df_subset):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_subset.to_excel(writer, index=False, sheet_name='원고작성')
+        worksheet = writer.sheets['원고작성']
+
+        # RGB(191, 191, 191) 색상 (HEX: BFBFBF)
+        gray_fill = PatternFill(start_color='BFBFBF', end_color='BFBFBF', fill_type='solid')
+
+        # 색상 적용 대상 컬럼
+        target_cols = ["service_code", "track_code", "top_cors_id", "component_code", "book_code", "act_code"]
+
+        for col_name in target_cols:
+            if col_name in df_subset.columns:
+                col_idx = df_subset.columns.get_loc(col_name) + 1
+                for row in range(1, len(df_subset) + 2):
+                    cell = worksheet.cell(row=row, column=col_idx)
+                    cell.fill = gray_fill
+
+    return output.getvalue()
+
 # --- 3. Streamlit UI (여기서 변수가 정의됩니다) ---
 st.set_page_config(page_title="최종 단어 변환기", layout="wide")
 st.title("📑 주차 연동 및 색상 지정 시스템")
@@ -284,6 +317,12 @@ with st.sidebar:
     book_code = st.text_input("book_code", "SVC170")
     act_name = st.text_input("act_name", "Vocablist")
     show_debug = st.checkbox("디버그 모드", value=False)
+
+    st.header("📁 파일명 설정")
+    st.caption("예: TOT_AU_Recap_S_W04_260731.xlsx")
+    file_name_prefix = st.text_input("파일명 접두어 (주차/날짜 앞부분)", "TOT_AU_Recap_S")
+    file_date = st.date_input("파일명 날짜", value=datetime.date.today())
+    date_str = file_date.strftime("%y%m%d")
 
 # 중요: 여기서 uploaded_file 변수가 정의됩니다!
 uploaded_file = st.file_uploader("워드(.docx) 또는 PDF(.pdf) 파일을 업로드하세요", type=["docx", "pdf"])
@@ -326,31 +365,43 @@ if uploaded_file is not None:
         st.success("✅ 분석 완료!")
         st.dataframe(df_final)
 
-        # 엑셀 생성 및 색칠
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_final.to_excel(writer, index=False, sheet_name='원고작성')
-            workbook = writer.book
-            worksheet = writer.sheets['원고작성']
-            
-            # RGB(191, 191, 191) 색상 (HEX: BFBFBF)
-            gray_fill = PatternFill(start_color='BFBFBF', end_color='BFBFBF', fill_type='solid')
-            
-            # 색상 적용 대상 컬럼
-            target_cols = ["service_code", "track_code", "top_cors_id", "component_code", "book_code", "act_code"]
-            
-            for col_name in target_cols:
-                if col_name in df_final.columns:
-                    col_idx = df_final.columns.get_loc(col_name) + 1
-                    for row in range(1, len(df_final) + 2):
-                        cell = worksheet.cell(row=row, column=col_idx)
-                        cell.fill = gray_fill
+        # 전체 결과물(모든 주차 통합) 엑셀
+        excel_bytes_all = build_excel_bytes(df_final)
+        all_file_name = f"{file_name_prefix}_{date_str}.xlsx"
 
         st.download_button(
-            label="📊 최종 결과물 다운로드",
-            data=output.getvalue(),
-            file_name=f"Standard_Vocab_{level_code}.xlsx",
+            label="📊 전체 결과물 다운로드 (모든 주차 통합)",
+            data=excel_bytes_all,
+            file_name=all_file_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # 주차별 파일 생성 (개별 다운로드 + ZIP 일괄 다운로드)
+        st.subheader("📅 주차별 다운로드")
+
+        week_numbers = sorted(df_final["lesson_order_seq"].unique())
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for week_num in week_numbers:
+                week_df = df_final[df_final["lesson_order_seq"] == week_num]
+                week_bytes = build_excel_bytes(week_df)
+                week_file_name = f"{file_name_prefix}_W{int(week_num):02d}_{date_str}.xlsx"
+                zf.writestr(week_file_name, week_bytes)
+
+                st.download_button(
+                    label=f"⬇️ Week {int(week_num):02d} 다운로드 ({len(week_df)}개 단어)",
+                    data=week_bytes,
+                    file_name=week_file_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"week_download_{week_num}"
+                )
+
+        st.download_button(
+            label="🗂️ 주차별 파일 전체 ZIP으로 한꺼번에 다운로드",
+            data=zip_buffer.getvalue(),
+            file_name=f"{file_name_prefix}_ALL_{date_str}.zip",
+            mime="application/zip"
         )
     
     if show_debug:
