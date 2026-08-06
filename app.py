@@ -33,14 +33,22 @@ def clean_filename(text):
     # 대소문자는 vocabulary 원문 그대로 유지 (예: protect A from B -> protect_A_from_B.mp3)
     return text + ".mp3"
 
-# 챕터 표기 감지: "Chapter 1", "CHAPTER 01", "CH01", "CH02" 등 여러 형식 지원
+# 챕터/회차 표기 감지: "Chapter 1", "CHAPTER 01", "CH01", "CH02", "1회", "04회" 등 지원
 CHAPTER_LINE_PATTERN = re.compile(r'(?i)^(?:chapter|ch)\.?\s*0*(\d+)\b')
+ROUND_LINE_PATTERN = re.compile(r'^제?\s*0*(\d+)\s*회\s*$')
 
 def detect_chapter_number(line):
-    m = CHAPTER_LINE_PATTERN.match(line.strip())
+    stripped = line.strip()
+    m = CHAPTER_LINE_PATTERN.match(stripped)
+    if m:
+        return int(m.group(1))
+    m = ROUND_LINE_PATTERN.match(stripped)
     if m:
         return int(m.group(1))
     return None
+
+def is_round_marker(line):
+    return ROUND_LINE_PATTERN.match(line.strip()) is not None
 
 # 2. 워드 파싱 함수
 def parse_word_content(docx_file):
@@ -64,9 +72,17 @@ def parse_word_content(docx_file):
                 paragraphs.append(sub)
 
     # 번호는 "1. word" (마침표)와 "01  word" (공백 2칸) 형식을 모두 지원
-    entry_pattern = re.compile(r'^(?:\d+[\.\s]+)?([^:]+):\s*(.*)$')
+    entry_pattern = re.compile(r'^(?:(\d+)[\.\s]+)?([^:]+):\s*(.*)$')
     keyword_only_pattern = re.compile(r'(?i)^(Syn|Ant|Atn|유의어|반의어)$')
     tail_keyword_pattern = re.compile(r'(?i)^(Syn|Ant|Atn|유의어|반의어)\s*:\s*(.*)$')
+
+    # "1회", "04회"처럼 "~회" 표기가 문서 어딘가에 하나라도 있으면, 그 표기가
+    # 누락된 곳도 있을 수 있다고 보고 번호가 정확히 1로 리셋되는 지점(예: ...20. -> 1.)을
+    # 새 회차 시작으로 자동 보완합니다. "CH01" 같은 챕터 표기만 쓰는 문서(예: 회차 내부에
+    # 번호가 우연히 반복/오탈자로 흐트러지는 경우)에는 적용하지 않아 기존 동작을 유지합니다.
+    use_round_reset_fallback = any(is_round_marker(l) for l in paragraphs)
+    previous_entry_num = None
+    just_saw_explicit_marker = False
 
     for line in paragraphs:
         raw_texts.append(line)
@@ -77,17 +93,36 @@ def parse_word_content(docx_file):
             current_week_num = chapter_num
             current_week_title = f"Week{current_week_num:02d}/"
             current_chapter_num = 1
+            previous_entry_num = None
+            just_saw_explicit_marker = True
             continue
 
         # 단어: 뜻 [탭/2칸 이상 공백 + Syn/Ant: 유의어] 추출
         match = entry_pattern.match(line)
 
         if match:
-            raw_word = expand_sb_sth(match.group(1).strip())
+            entry_num_str = match.group(1)
+            raw_word = expand_sb_sth(match.group(2).strip())
 
             # "Syn: xxx" 처럼 단어 없이 유의어만 있는 줄은 아래 유의어 처리 블록으로 넘김
             if not keyword_only_pattern.match(raw_word):
-                rest = match.group(2)
+                # 번호가 이전보다 작아지며 리셋되면 새 회차(챕터) 시작으로 간주
+                # (단, 직전에 명시적 챕터/회차 마커를 이미 처리했다면 중복 증가하지 않음)
+                if entry_num_str is not None:
+                    entry_num = int(entry_num_str)
+                    # 번호가 정확히 1로 리셋되는 경우만 새 회차 시작으로 인정
+                    # (오탈자로 인한 불규칙한 감소는 무시하여 오탐을 방지)
+                    if (use_round_reset_fallback and previous_entry_num is not None
+                            and entry_num == 1 and previous_entry_num != 1
+                            and not just_saw_explicit_marker):
+                        current_week_num += 1
+                        current_week_title = f"Week{current_week_num:02d}/"
+                        current_chapter_num = 1
+                    previous_entry_num = entry_num
+
+                just_saw_explicit_marker = False
+
+                rest = match.group(3)
 
                 # 뜻과 유의어/반의어를 탭 또는 2칸 이상 공백으로 분리
                 parts = re.split(r'\t|\s{2,}', rest, maxsplit=1)
