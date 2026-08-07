@@ -338,7 +338,7 @@ def parse_pdf_content(pdf_file):
 
 # 4. 엑셀 생성 헬퍼: 제공된 서식 템플릿(TO_Recap_S_원고템플릿.xlsx)을 그대로 사용해서
 #    "원고작성" 시트에 데이터를 채우고, "문서개정" 시트는 그대로 포함시킵니다.
-TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "TO_Recap_S_원고템플릿.xlsx")
+TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "template.xlsx")
 
 # 템플릿의 회차(Prompt) 행 규칙: act_code=RSV_ACT001 / act_name=Prompt / page_order_seq=1 / prompt=prompt.FOLDER
 PROMPT_ACT_CODE = "RSV_ACT001"
@@ -410,7 +410,7 @@ with st.sidebar:
     service_code = st.text_input("service_code", "SVC170")
     track_code = st.text_input("track_code", "RSV_TRK01")
     top_cors_id = st.text_input("top_cors_id", "1879")
-    level_code = st.text_input("level_code", "")
+    level_code = st.text_input("level_code", "TO_R_E_SP")
     component_code = st.text_input("component_code", "COM170")
     book_code = st.text_input("book_code", "SVC170")
     act_name = st.text_input("act_name", "Vocab list")
