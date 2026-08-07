@@ -5,9 +5,11 @@ from docx.oxml.ns import qn
 import pdfplumber
 import io
 import re
+import os
 import zipfile
 import datetime
-from openpyxl.styles import PatternFill
+from copy import copy
+from openpyxl import load_workbook
 
 # 1. 파일명 규칙 정제 함수
 
@@ -58,7 +60,7 @@ def parse_word_content(docx_file):
     raw_texts = []
     
     current_chapter_num = 1
-    current_week_title = "Week01/"
+    current_week_title = "Week 01/"
     current_week_num = 1
     
     # 문서 내부 텍스트(마커/번호)뿐 아니라, 워드의 '구역 나누기(section break)'도
@@ -98,7 +100,7 @@ def parse_word_content(docx_file):
         if token_type == "section_break":
             # 구역 나누기 = 새 회차(챕터) 시작 신호
             current_week_num += 1
-            current_week_title = f"Week{current_week_num:02d}/"
+            current_week_title = f"Week {current_week_num:02d}/"
             current_chapter_num = 1
             previous_entry_num = None
             just_saw_explicit_marker = True
@@ -110,7 +112,7 @@ def parse_word_content(docx_file):
         chapter_num = detect_chapter_number(line)
         if chapter_num is not None:
             current_week_num = chapter_num
-            current_week_title = f"Week{current_week_num:02d}/"
+            current_week_title = f"Week {current_week_num:02d}/"
             current_chapter_num = 1
             previous_entry_num = None
             just_saw_explicit_marker = True
@@ -135,7 +137,7 @@ def parse_word_content(docx_file):
                             and entry_num == 1 and previous_entry_num != 1
                             and not just_saw_explicit_marker):
                         current_week_num += 1
-                        current_week_title = f"Week{current_week_num:02d}/"
+                        current_week_title = f"Week {current_week_num:02d}/"
                         current_chapter_num = 1
                     previous_entry_num = entry_num
 
@@ -218,7 +220,7 @@ def parse_word_content_glossary_style(docx_file):
     raw_texts = list(raw_lines)
 
     current_chapter_num = 1
-    current_week_title = "Week01/"
+    current_week_title = "Week 01/"
     current_week_num = 1
 
     tail_keyword_pattern = re.compile(r'(?i)^(syn|ant|atn|유의어|반의어)\s*:\s*(.*)$')
@@ -232,7 +234,7 @@ def parse_word_content_glossary_style(docx_file):
         chapter_num = detect_chapter_number(line)
         if chapter_num is not None:
             current_week_num = chapter_num
-            current_week_title = f"Week{current_week_num:02d}/"
+            current_week_title = f"Week {current_week_num:02d}/"
             current_chapter_num = 1
             i += 1
             continue
@@ -283,7 +285,7 @@ def parse_pdf_content(pdf_file):
     raw_texts = []
 
     current_chapter_num = 1
-    current_week_title = "Week01/"
+    current_week_title = "Week 01/"
     current_week_num = 1
 
     # PDF 텍스트 추출 시 "01 word: 뜻   Syn: xxx" 처럼 번호가 마침표 없이
@@ -299,7 +301,7 @@ def parse_pdf_content(pdf_file):
         chapter_num = detect_chapter_number(line)
         if chapter_num is not None:
             current_week_num = chapter_num
-            current_week_title = f"Week{current_week_num:02d}/"
+            current_week_title = f"Week {current_week_num:02d}/"
             current_chapter_num = 1
             continue
 
@@ -334,26 +336,68 @@ def parse_pdf_content(pdf_file):
 
     return data, raw_texts
 
-# 4. 엑셀 생성 헬퍼 (지정된 컬럼에 회색 배경 적용)
+# 4. 엑셀 생성 헬퍼: 제공된 서식 템플릿(TO_Recap_S_원고템플릿.xlsx)을 그대로 사용해서
+#    "원고작성" 시트에 데이터를 채우고, "문서개정" 시트는 그대로 포함시킵니다.
+TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "TO_Recap_S_원고템플릿.xlsx")
+
+# 템플릿의 회차(Prompt) 행 규칙: act_code=RSV_ACT001 / act_name=Prompt / page_order_seq=1 / prompt=prompt.FOLDER
+PROMPT_ACT_CODE = "RSV_ACT001"
+PROMPT_ACT_NAME = "Prompt"
+PROMPT_VALUE = "prompt.FOLDER"
+
+FINAL_COLS = [
+    "service_code", "track_code", "top_cors_id", "level_code",
+    "component_code", "book_code", "lesson_order_seq", "lesson_title",
+    "act_code", "act_name", "page_order_seq", "vocabulary",
+    "vocabulary_kor", "vocabulary_sound", "vocabulary_excep", "prompt"
+]
+
 def build_excel_bytes(df_subset):
+    wb = load_workbook(TEMPLATE_PATH)
+    ws = wb["원고작성"]
+
+    # 템플릿 예시 행(2행=Prompt 행, 3행=단어 행)에서 컬럼별 스타일을 미리 복사해둔 뒤
+    # 예시 데이터를 지우고, 실제 데이터를 같은 스타일로 다시 채웁니다.
+    prompt_row_styles = {c: copy(ws.cell(row=2, column=c)._style) for c in range(1, 17)}
+    vocab_row_styles = {c: copy(ws.cell(row=3, column=c)._style) for c in range(1, 17)}
+
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    def write_row(row_idx, values, styles):
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value if value != "" else None)
+            cell._style = styles[col_idx]
+
+    row_idx = 2
+    # lesson_order_seq(주차) 등장 순서를 유지하면서 그룹핑
+    week_order = list(dict.fromkeys(df_subset["lesson_order_seq"].tolist()))
+
+    for week_num in week_order:
+        week_df = df_subset[df_subset["lesson_order_seq"] == week_num]
+        first = week_df.iloc[0]
+
+        # 회차(Prompt) 행 - 고정값들은 해당 주차 단어 행과 동일한 값을 그대로 사용
+        write_row(row_idx, [
+            first["service_code"], first["track_code"], first["top_cors_id"],
+            first["level_code"], first["component_code"], first["book_code"],
+            week_num, first["lesson_title"], PROMPT_ACT_CODE, PROMPT_ACT_NAME, 1,
+            "", "", "", "", PROMPT_VALUE
+        ], prompt_row_styles)
+        row_idx += 1
+
+        # 단어 행들
+        for _, r in week_df.iterrows():
+            write_row(row_idx, [
+                r["service_code"], r["track_code"], r["top_cors_id"], r["level_code"],
+                r["component_code"], r["book_code"], r["lesson_order_seq"], r["lesson_title"],
+                r["act_code"], r["act_name"], r["page_order_seq"], r["vocabulary"],
+                r["vocabulary_kor"], r["vocabulary_sound"], r["vocabulary_excep"], r["prompt"]
+            ], vocab_row_styles)
+            row_idx += 1
+
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_subset.to_excel(writer, index=False, sheet_name='원고작성')
-        worksheet = writer.sheets['원고작성']
-
-        # RGB(191, 191, 191) 색상 (HEX: BFBFBF)
-        gray_fill = PatternFill(start_color='BFBFBF', end_color='BFBFBF', fill_type='solid')
-
-        # 색상 적용 대상 컬럼
-        target_cols = ["service_code", "track_code", "top_cors_id", "component_code", "book_code", "act_code"]
-
-        for col_name in target_cols:
-            if col_name in df_subset.columns:
-                col_idx = df_subset.columns.get_loc(col_name) + 1
-                for row in range(1, len(df_subset) + 2):
-                    cell = worksheet.cell(row=row, column=col_idx)
-                    cell.fill = gray_fill
-
+    wb.save(output)
     return output.getvalue()
 
 # --- 3. Streamlit UI (여기서 변수가 정의됩니다) ---
@@ -366,10 +410,10 @@ with st.sidebar:
     service_code = st.text_input("service_code", "SVC170")
     track_code = st.text_input("track_code", "RSV_TRK01")
     top_cors_id = st.text_input("top_cors_id", "1879")
-    level_code = st.text_input("level_code", "TO_R_E_SP")
+    level_code = st.text_input("level_code", "")
     component_code = st.text_input("component_code", "COM170")
     book_code = st.text_input("book_code", "SVC170")
-    act_name = st.text_input("act_name", "Vocablist")
+    act_name = st.text_input("act_name", "Vocab list")
     show_debug = st.checkbox("디버그 모드", value=False)
 
     st.header("📁 파일명 설정")
@@ -400,21 +444,19 @@ if uploaded_file is not None:
         # 고정값 채우기
         df['service_code'] = service_code
         df['track_code'] = track_code
-        df['top_cors_id'] = top_cors_id
+        # top_cors_id는 템플릿처럼 숫자면 숫자 그대로 기입
+        try:
+            df['top_cors_id'] = int(top_cors_id)
+        except (ValueError, TypeError):
+            df['top_cors_id'] = top_cors_id
         df['level_code'] = level_code
         df['component_code'] = component_code
         df['book_code'] = book_code
         df['act_code'] = "RSV_ACT002"
         df['act_name'] = act_name
         
-        # 컬럼 순서 재배치
-        final_cols = [
-            "service_code", "track_code", "top_cors_id", "level_code", 
-            "component_code", "book_code", "lesson_order_seq", "lesson_title", 
-            "act_code", "act_name", "page_order_seq", "vocabulary", 
-            "vocabulary_kor", "vocabulary_sound", "vocabulary_excep", "prompt"
-        ]
-        df_final = df.reindex(columns=final_cols).fillna("")
+        # 컬럼 순서 재배치 (템플릿 헤더 순서와 동일)
+        df_final = df.reindex(columns=FINAL_COLS).fillna("")
 
         st.success("✅ 분석 완료!")
         st.dataframe(df_final)
