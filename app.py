@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from docx import Document
+from docx.oxml.ns import qn
 import pdfplumber
 import io
 import re
@@ -60,16 +61,25 @@ def parse_word_content(docx_file):
     current_week_title = "Week01/"
     current_week_num = 1
     
-    paragraphs = []
+    # 문서 내부 텍스트(마커/번호)뿐 아니라, 워드의 '구역 나누기(section break)'도
+    # 회차 경계로 활용합니다. PDF -> 워드 변환 과정에서 "1회/2회..." 같은 텍스트 라벨은
+    # 사라져도, 원래 페이지 구분에 쓰였던 구역 나누기는 그대로 남아있는 경우가 많습니다.
+    # 각 항목은 ("text", 줄내용) 또는 ("section_break", None) 형태의 토큰입니다.
+    tokens = []
     for p in doc.paragraphs:
-        if not p.text.strip():
-            continue
-        # Shift+Enter(줄바꿈)로 한 문단 안에 여러 줄(예: "word: 뜻" 다음 줄에 "Syn: ...")이
-        # 들어있는 경우를 대비해 문단 내부의 줄바꿈 기준으로도 분리
-        for sub in p.text.split("\n"):
-            sub = sub.strip()
-            if sub:
-                paragraphs.append(sub)
+        if p.text.strip():
+            # Shift+Enter(줄바꿈)로 한 문단 안에 여러 줄(예: "word: 뜻" 다음 줄에 "Syn: ...")이
+            # 들어있는 경우를 대비해 문단 내부의 줄바꿈 기준으로도 분리
+            for sub in p.text.split("\n"):
+                sub = sub.strip()
+                if sub:
+                    tokens.append(("text", sub))
+
+        pPr = p._p.find(qn('w:pPr'))
+        if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
+            tokens.append(("section_break", None))
+
+    paragraphs = [t[1] for t in tokens if t[0] == "text"]
 
     # 번호는 "1. word" (마침표)와 "01  word" (공백 2칸) 형식을 모두 지원
     entry_pattern = re.compile(r'^(?:(\d+)[\.\s]+)?([^:]+):\s*(.*)$')
@@ -84,7 +94,16 @@ def parse_word_content(docx_file):
     previous_entry_num = None
     just_saw_explicit_marker = False
 
-    for line in paragraphs:
+    for token_type, line in tokens:
+        if token_type == "section_break":
+            # 구역 나누기 = 새 회차(챕터) 시작 신호
+            current_week_num += 1
+            current_week_title = f"Week{current_week_num:02d}/"
+            current_chapter_num = 1
+            previous_entry_num = None
+            just_saw_explicit_marker = True
+            continue
+
         raw_texts.append(line)
         
         # 챕터 감지 (Week 번호 연동)
