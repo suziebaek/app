@@ -86,7 +86,8 @@ def parse_word_content(docx_file):
     # 번호는 "1. word" (마침표)와 "01  word" (공백 2칸) 형식을 모두 지원
     entry_pattern = re.compile(r'^(?:(\d+)[\.\s]+)?([^:]+):\s*(.*)$')
     keyword_only_pattern = re.compile(r'(?i)^(Syn|Ant|Atn|유의어|반의어)$')
-    tail_keyword_pattern = re.compile(r'(?i)^(Syn|Ant|Atn|유의어|반의어)\s*:\s*(.*)$')
+    # vocabulary_excep에는 유의어(Syn)만 채웁니다 (반의어/Ant는 제외)
+    tail_keyword_pattern = re.compile(r'(?i)^(Syn|유의어)\s*:\s*(.*)$')
 
     # "1회", "04회"처럼 "~회" 표기가 문서 어딘가에 하나라도 있으면, 그 표기가
     # 누락된 곳도 있을 수 있다고 보고 번호가 정확히 1로 리셋되는 지점(예: ...20. -> 1.)을
@@ -172,8 +173,8 @@ def parse_word_content(docx_file):
                     current_chapter_num += 1
                 continue
         
-        # 유의어 처리 (Syn/Ant가 별도의 줄로 존재하는 예전 형식 지원)
-        if any(keyword in line for keyword in ["Syn", "Atn", "Ant", "유의어", "반의어"]):
+        # 유의어 처리 (Syn이 별도의 줄로 존재하는 예전 형식 지원, Ant/반의어는 제외)
+        if any(keyword in line for keyword in ["Syn", "유의어"]):
             extra_info = line.split(":", 1)[-1].strip()
             if data:
                 first_extra = re.split(r'\s{2,}', extra_info)[0].strip()
@@ -223,7 +224,8 @@ def parse_word_content_glossary_style(docx_file):
     current_week_title = "Week 01/"
     current_week_num = 1
 
-    tail_keyword_pattern = re.compile(r'(?i)^(syn|ant|atn|유의어|반의어)\s*:\s*(.*)$')
+    # vocabulary_excep에는 유의어(Syn)만 채웁니다 (반의어/Ant는 제외)
+    tail_keyword_pattern = re.compile(r'(?i)^(syn|유의어)\s*:\s*(.*)$')
 
     i = 0
     n = len(raw_lines)
@@ -292,7 +294,9 @@ def parse_pdf_content(pdf_file):
     # 붙는 형태와, 뜻과 Syn/Ant 사이가 한 칸 공백으로만 구분되는 경우가 많아
     # 워드용 정규식과는 별도의 패턴을 사용합니다.
     entry_pattern = re.compile(r'^\d{1,2}\s+([^:]+):\s*(.*)$')
-    syn_pattern = re.compile(r'\b(Syn|Ant)\s*:\s*(.+)$')
+    # Syn/Ant 둘 다 감지해서 뜻(meaning)에서는 잘라내되, vocabulary_excep에는 Syn만 채웁니다
+    tail_start_pattern = re.compile(r'\b(Syn|Ant)\s*:')
+    syn_value_pattern = re.compile(r'\bSyn\s*:\s*(.+)$')
 
     for line in lines:
         raw_texts.append(line)
@@ -311,10 +315,12 @@ def parse_pdf_content(pdf_file):
             raw_word = expand_sb_sth(match.group(1).strip())
             rest = match.group(2).strip()
 
-            syn_match = syn_pattern.search(rest)
-            if syn_match:
-                meaning = rest[:syn_match.start()].strip()
-                extra_info = syn_match.group(2).strip()
+            tail_match = tail_start_pattern.search(rest)
+            if tail_match:
+                meaning = rest[:tail_match.start()].strip()
+                tail = rest[tail_match.start():]
+                syn_match = syn_value_pattern.search(tail)
+                extra_info = syn_match.group(1).strip() if syn_match else ""
             else:
                 meaning = rest
                 extra_info = ""
