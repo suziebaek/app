@@ -31,7 +31,8 @@ def expand_abbreviations(text):
 
 def clean_filename(text):
     text = expand_abbreviations(text)
-    text = text.replace(" ", "_")
+    # 공백/하이픈은 언더바로 치환 (예: voice-assisted -> voice_assisted)
+    text = re.sub(r'[\s\-]+', '_', text)
     text = re.sub(r'[^a-zA-Z0-9_]', '', text)
     # 대소문자는 vocabulary 원문 그대로 유지 (예: protect A from B -> protect_A_from_B.mp3)
     return text + ".mp3"
@@ -202,7 +203,12 @@ def _is_glossary_word_start(lines, idx):
         return False
     if idx + 1 >= len(lines):
         return False
-    return _has_korean(lines[idx + 1])
+    next_line = lines[idx + 1]
+    # 활용/연어(collocation) 목록 줄은 "/"로 구분되며, 그 안에 "+ 기간"처럼
+    # 한글 플레이스홀더가 섞여 있어도 뜻(meaning) 줄로 오인하지 않도록 제외합니다.
+    if "/" in next_line:
+        return False
+    return _has_korean(next_line)
 
 def parse_word_content_glossary_style(docx_file):
     doc = Document(docx_file)
