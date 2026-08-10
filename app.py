@@ -155,7 +155,7 @@ def parse_word_content(docx_file):
                     tail = parts[1].strip()
                     tail_match = tail_keyword_pattern.match(tail)
                     if tail_match:
-                        extra_info = tail_match.group(2).strip()
+                        extra_info = expand_sb_sth(tail_match.group(2).strip())
 
                 if re.search(r'[가-힣]', meaning):
                     sound_file = clean_filename(raw_word)
@@ -177,7 +177,7 @@ def parse_word_content(docx_file):
         if any(keyword in line for keyword in ["Syn", "유의어"]):
             extra_info = line.split(":", 1)[-1].strip()
             if data:
-                first_extra = re.split(r'\s{2,}', extra_info)[0].strip()
+                first_extra = expand_sb_sth(re.split(r'\s{2,}', extra_info)[0].strip())
                 data[-1]["vocabulary_excep"] = first_extra
 
     return data, raw_texts
@@ -252,7 +252,7 @@ def parse_word_content_glossary_style(docx_file):
             while j < n and not _is_glossary_word_start(raw_lines, j) and detect_chapter_number(raw_lines[j]) is None:
                 tail_match = tail_keyword_pattern.match(raw_lines[j])
                 if tail_match and not extra_info:
-                    extra_info = tail_match.group(2).strip()
+                    extra_info = expand_sb_sth(tail_match.group(2).strip())
                 j += 1
 
             if _has_korean(meaning):
@@ -320,7 +320,7 @@ def parse_pdf_content(pdf_file):
                 meaning = rest[:tail_match.start()].strip()
                 tail = rest[tail_match.start():]
                 syn_match = syn_value_pattern.search(tail)
-                extra_info = syn_match.group(1).strip() if syn_match else ""
+                extra_info = expand_sb_sth(syn_match.group(1).strip()) if syn_match else ""
             else:
                 meaning = rest
                 extra_info = ""
