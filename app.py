@@ -307,12 +307,14 @@ def parse_pdf_content(pdf_file):
     for line in lines:
         raw_texts.append(line)
 
-        # 챕터 감지 (Week 번호 연동)
+        # 챕터 감지 (Week 번호 연동, 페이지 하단에 챕터 번호가 반복 출력되는
+        # 문서도 있어 실제로 챕터가 바뀔 때만 카운터를 리셋합니다)
         chapter_num = detect_chapter_number(line)
         if chapter_num is not None:
-            current_week_num = chapter_num
-            current_week_title = f"Week {current_week_num:02d}/"
-            current_chapter_num = 1
+            if chapter_num != current_week_num:
+                current_week_num = chapter_num
+                current_week_title = f"Week {current_week_num:02d}/"
+                current_chapter_num = 1
             continue
 
         # 번호 + 단어: 뜻 [Syn/Ant: 유의어] 추출
@@ -342,6 +344,64 @@ def parse_pdf_content(pdf_file):
                     "vocabulary_kor": meaning,
                     "vocabulary_sound": sound_file,
                     "vocabulary_excep": extra_info,
+                    "prompt": ""
+                })
+                current_chapter_num += 1
+
+    return data, raw_texts
+
+# 2-2. PDF 파싱 함수 (품사 표기형: "01 word 품사. 뜻" 형식, 콜론 없음, 단원 코드 접미)
+# 예: "01 spicy adj. 매운 LZ" / "02 taste n. 맛 v. ~한 맛이 나다 LZ"
+def parse_pdf_content_pos_style(pdf_file):
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
+
+    data = []
+    raw_texts = []
+
+    current_chapter_num = 1
+    current_week_title = "Week 01/"
+    current_week_num = 1
+
+    # 번호, 단어(구), 품사(n./v./adj./adv./prep./conj., 필요시 phr. 포함), 뜻,
+    # 그리고 마지막에 붙는 단원 코드(LZ/U1/U2/TS)까지 한 줄에 모두 들어있는 형식
+    entry_pattern = re.compile(
+        r"^(\d{1,2})\s+([A-Za-z][A-Za-z'\-\s]*?)\s+"
+        r"((?:n|v|adj|adv|prep|conj)\.\s*(?:phr\.\s*)?)(.*?)(?:\s+(?:LZ|U1|U2|TS))?$"
+    )
+    # 뜻 안에 품사가 여러 번(예: "맛 v. ~한 맛이 나다") 섞여 있으면 쉼표로 구분
+    pos_inline_pattern = re.compile(r"\s*\b(?:n|v|adj|adv|prep|conj)\.\s*(?:phr\.\s*)?")
+
+    for line in lines:
+        raw_texts.append(line)
+
+        chapter_num = detect_chapter_number(line)
+        if chapter_num is not None:
+            if chapter_num != current_week_num:
+                current_week_num = chapter_num
+                current_week_title = f"Week {current_week_num:02d}/"
+                current_chapter_num = 1
+            continue
+
+        match = entry_pattern.match(line)
+        if match:
+            raw_word = expand_sb_sth(match.group(2).strip())
+            rest = match.group(4).strip()
+            meaning = pos_inline_pattern.sub(", ", rest).strip(", ").strip()
+
+            if re.search(r'[가-힣]', meaning):
+                sound_file = clean_filename(raw_word)
+
+                data.append({
+                    "lesson_title": current_week_title,
+                    "lesson_order_seq": current_week_num,
+                    "page_order_seq": current_chapter_num,
+                    "vocabulary": raw_word,
+                    "vocabulary_kor": meaning,
+                    "vocabulary_sound": sound_file,
+                    "vocabulary_excep": "",
                     "prompt": ""
                 })
                 current_chapter_num += 1
@@ -443,6 +503,10 @@ if uploaded_file is not None:
 
     if file_ext == "pdf":
         parsed_data, raw_texts = parse_pdf_content(uploaded_file)
+        # 콜론 기반(word: 뜻) 형식으로 하나도 못 찾으면, 품사 표기형(word 품사. 뜻)으로 재시도
+        if not parsed_data:
+            uploaded_file.seek(0)
+            parsed_data, raw_texts = parse_pdf_content_pos_style(uploaded_file)
     else:
         parsed_data, raw_texts = parse_word_content(uploaded_file)
         # 기본 형식(단어: 뜻)으로 하나도 못 찾으면, 용어집(Glossary) 형식으로 재시도
