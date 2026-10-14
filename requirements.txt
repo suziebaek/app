@@ -3,3 +3,6 @@ pandas
 python-docx
 pdfplumber
 openpyxl
+edge-tts>=7.3.1
+imageio-ffmpeg
+mutagen

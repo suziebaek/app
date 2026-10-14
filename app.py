@@ -472,11 +472,445 @@ def build_excel_bytes(df_subset):
     wb.save(output)
     return output.getvalue()
 
-# --- 3. Streamlit UI (여기서 변수가 정의됩니다) ---
-st.set_page_config(page_title="최종 단어 변환기", layout="wide")
-st.title("📑 주차 연동 및 색상 지정 시스템")
+# ==========================================================================
+# 5. 원본 파일 파싱 (탭1, 탭2 공용)
+# ==========================================================================
+import asyncio
+import time
+import shutil
+import tempfile
+import subprocess
+import collections
 
-# 사이드바 설정
+def parse_source_file(uploaded):
+    """워드/PDF를 기존 파서로 분석합니다. (탭1의 기존 동작과 동일)"""
+    file_ext = uploaded.name.lower().rsplit(".", 1)[-1]
+    uploaded.seek(0)
+    if file_ext == "pdf":
+        parsed_data, raw_texts = parse_pdf_content(uploaded)
+        if not parsed_data:
+            uploaded.seek(0)
+            parsed_data, raw_texts = parse_pdf_content_pos_style(uploaded)
+    else:
+        parsed_data, raw_texts = parse_word_content(uploaded)
+        if not parsed_data:
+            uploaded.seek(0)
+            parsed_data, raw_texts = parse_word_content_glossary_style(uploaded)
+    return parsed_data, raw_texts
+
+
+# ==========================================================================
+# 6. 자동 검수 (탭2)
+# ==========================================================================
+HANGUL = re.compile(r'[가-힣]')
+ABBR_PATTERN = re.compile(r'\b(sb|sth|V-ing|to V)\b')
+EXCEL_NAME_PATTERN = re.compile(r'^(.+)_W(\d{2})_(\d{6})\.xlsx$')
+FIXED_COLS = ["service_code", "track_code", "top_cors_id", "level_code", "component_code", "book_code"]
+VOCAB_ACT_CODE = "RSV_ACT002"
+
+def _s(v):
+    """셀 값을 문자열로 (None -> '', 1.0 -> '1')"""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+def normalize_spaces(text):
+    """앞뒤 공백 제거 + 연속 공백을 한 칸으로"""
+    return re.sub(r'\s{2,}', ' ', text.strip())
+
+def load_revision_styles():
+    """템플릿 '문서개정' 시트의 수정 차수별 예시 셀(F20~F24) 서식을 그대로 가져옵니다."""
+    wb = load_workbook(TEMPLATE_PATH)
+    ws = wb["문서개정"]
+    styles = {}
+    for i, row in enumerate(range(20, 25), start=1):
+        cell = ws.cell(row=row, column=6)
+        styles[f"{i}차 수정"] = (copy(cell.fill), copy(cell.font.color))
+    return styles
+
+def check_workbook(file_name, file_bytes, source_rows=None, expected_fixed=None):
+    """엑셀 한 개를 검수해서 문제 목록을 돌려줍니다.
+    각 문제: 파일, 행, 열, 수준(오류/경고), 내용, 현재값, 제안값, 자동수정(True/False)"""
+    issues = []
+
+    def add(row, col, level, msg, current="", suggest="", fixable=False):
+        issues.append({
+            "파일": file_name, "행": row, "열": col, "수준": level, "내용": msg,
+            "현재값": current, "제안값": suggest, "자동수정": fixable,
+        })
+
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes))
+    except Exception as e:
+        add("-", "-", "오류", f"엑셀 파일을 열 수 없습니다: {e}")
+        return issues
+
+    # (1) 시트 구성
+    for sheet in ["원고작성", "문서개정"]:
+        if sheet not in wb.sheetnames:
+            add("-", "-", "오류", f"'{sheet}' 시트가 없습니다. (템플릿 정보 변경 금지)")
+    if "원고작성" not in wb.sheetnames:
+        return issues
+    ws = wb["원고작성"]
+
+    # (2) 헤더
+    header = [_s(c.value).strip() for c in ws[1]][:len(FINAL_COLS)]
+    if header != FINAL_COLS:
+        add(1, "-", "오류", "헤더(1행)가 템플릿과 다릅니다.", " | ".join(header), " | ".join(FINAL_COLS))
+        return issues
+    col_idx = {name: i + 1 for i, name in enumerate(FINAL_COLS)}
+
+    rows = []
+    for r in range(2, ws.max_row + 1):
+        vals = {name: ws.cell(row=r, column=col_idx[name]).value for name in FINAL_COLS}
+        if all(_s(v).strip() == "" for v in vals.values()):
+            continue
+        rows.append((r, vals))
+
+    if not rows:
+        add("-", "-", "오류", "데이터 행이 없습니다.")
+        return issues
+
+    # (3) 모든 문자열 셀: 불필요한 띄어쓰기
+    for r, vals in rows:
+        for name in FINAL_COLS:
+            v = vals[name]
+            if isinstance(v, str) and v != normalize_spaces(v):
+                add(r, name, "오류", "불필요한 띄어쓰기(앞뒤 공백 또는 연속 공백)",
+                    repr(v), normalize_spaces(v), True)
+
+    # (4) 행 단위 검사
+    sound_seen = {}
+    for r, vals in rows:
+        act = _s(vals["act_code"]).strip()
+        vocab = normalize_spaces(_s(vals["vocabulary"]))
+        kor = normalize_spaces(_s(vals["vocabulary_kor"]))
+        sound = normalize_spaces(_s(vals["vocabulary_sound"]))
+        excep = normalize_spaces(_s(vals["vocabulary_excep"]))
+        prompt = normalize_spaces(_s(vals["prompt"]))
+
+        if act == PROMPT_ACT_CODE:
+            if prompt != PROMPT_VALUE:
+                add(r, "prompt", "오류", f"Prompt 행의 prompt 값은 '{PROMPT_VALUE}'이어야 합니다.", prompt, PROMPT_VALUE)
+            if _s(vals["page_order_seq"]).strip() != "1":
+                add(r, "page_order_seq", "오류", "Prompt 행의 page_order_seq는 1이어야 합니다.", _s(vals["page_order_seq"]), "1")
+            if vocab or kor or sound or excep:
+                add(r, "vocabulary", "오류", "Prompt 행에는 단어 정보가 비어 있어야 합니다.")
+            continue
+
+        if act != VOCAB_ACT_CODE:
+            add(r, "act_code", "오류", "알 수 없는 act_code입니다.", act, f"{PROMPT_ACT_CODE} 또는 {VOCAB_ACT_CODE}")
+            continue
+
+        if not vocab:
+            add(r, "vocabulary", "오류", "단어가 비어 있습니다.")
+        elif HANGUL.search(vocab):
+            add(r, "vocabulary", "오류", "단어 칸에 한글이 들어 있습니다.", vocab)
+        elif ABBR_PATTERN.search(vocab):
+            add(r, "vocabulary", "경고", "줄임말(sb/sth/V-ing/to V)이 남아 있습니다. 표기 규칙을 확인하세요.", vocab)
+
+        if not kor:
+            add(r, "vocabulary_kor", "오류", "뜻이 비어 있습니다.")
+        elif not HANGUL.search(kor):
+            add(r, "vocabulary_kor", "경고", "뜻에 한글이 없습니다.", kor)
+
+        if vocab and not HANGUL.search(vocab):
+            expected = clean_filename(vocab)
+            if sound != expected:
+                add(r, "vocabulary_sound", "오류", "mp3 파일명이 단어에서 만든 규칙과 다릅니다.",
+                    sound, expected, True)
+        if sound:
+            if sound in sound_seen:
+                add(r, "vocabulary_sound", "오류", f"파일명이 {sound_seen[sound]}행과 중복됩니다.", sound)
+            else:
+                sound_seen[sound] = r
+
+        if excep:
+            if HANGUL.search(excep):
+                add(r, "vocabulary_excep", "경고", "유의어 칸에 한글이 들어 있습니다.", excep)
+            if re.match(r'(?i)^(syn|ant)\s*:', excep):
+                add(r, "vocabulary_excep", "오류", "유의어 칸에 'Syn:/Ant:' 표기가 남아 있습니다.", excep)
+
+        if prompt:
+            add(r, "prompt", "경고", "단어 행의 prompt 칸은 비어 있어야 합니다.", prompt)
+
+    # (5) 회차(lesson)별 구성 검사
+    lessons = collections.OrderedDict()
+    for r, vals in rows:
+        lessons.setdefault(_s(vals["lesson_order_seq"]).strip(), []).append((r, vals))
+
+    for seq, lrows in lessons.items():
+        first_row = lrows[0][0]
+        try:
+            seq_num = int(seq)
+            expected_title = f"Week {seq_num:02d}/"
+        except ValueError:
+            add(first_row, "lesson_order_seq", "오류", "lesson_order_seq가 숫자가 아닙니다.", seq)
+            continue
+
+        for r, vals in lrows:
+            title = normalize_spaces(_s(vals["lesson_title"]))
+            if title != expected_title:
+                add(r, "lesson_title", "오류", "lesson_title이 회차 번호와 맞지 않습니다.", title, expected_title)
+
+        prompt_rows = [r for r, v in lrows if _s(v["act_code"]).strip() == PROMPT_ACT_CODE]
+        if len(prompt_rows) != 1:
+            add(first_row, "act_code", "오류", f"Week {seq_num:02d}의 Prompt 행이 {len(prompt_rows)}개입니다. (1개여야 함)")
+        elif prompt_rows[0] != first_row:
+            add(prompt_rows[0], "act_code", "경고", "Prompt 행이 회차의 첫 행이 아닙니다.")
+
+        vocab_rows = [(r, v) for r, v in lrows if _s(v["act_code"]).strip() == VOCAB_ACT_CODE]
+        for expected_n, (r, v) in enumerate(vocab_rows, start=1):
+            actual = _s(v["page_order_seq"]).strip()
+            if actual != str(expected_n):
+                add(r, "page_order_seq", "오류", "번호가 1부터 순서대로 이어지지 않습니다.", actual, str(expected_n))
+
+    # (6) 고정값 일관성
+    for name in FIXED_COLS + ["act_name"]:
+        if name == "act_name":
+            values = {_s(v[name]).strip() for _, v in rows if _s(v["act_code"]).strip() == VOCAB_ACT_CODE}
+        else:
+            values = {_s(v[name]).strip() for _, v in rows}
+        if len(values) > 1:
+            add("-", name, "오류", "같은 파일 안에서 값이 서로 다릅니다.", ", ".join(sorted(values)))
+        if expected_fixed and name in expected_fixed:
+            exp = str(expected_fixed[name]).strip()
+            wrong = sorted(v for v in values if v != exp)
+            if wrong:
+                add("-", name, "오류", "사이드바 고정값과 다릅니다.", ", ".join(wrong), exp)
+
+    # (7) 엑셀 파일명 규칙: 접두어_W##_yymmdd.xlsx
+    m = EXCEL_NAME_PATTERN.match(file_name)
+    if not m:
+        add("-", "파일명", "경고", "파일명이 '접두어_W##_yymmdd.xlsx' 형식이 아닙니다.", file_name)
+    else:
+        try:
+            datetime.datetime.strptime(m.group(3), "%y%m%d")
+        except ValueError:
+            add("-", "파일명", "오류", "파일명의 날짜(yymmdd)가 올바르지 않습니다.", m.group(3))
+        lesson_keys = [k for k in lessons.keys()]
+        if len(lesson_keys) == 1 and lesson_keys[0].isdigit() and int(lesson_keys[0]) != int(m.group(2)):
+            add("-", "파일명", "오류", "파일명의 주차(W##)와 lesson_order_seq가 다릅니다.",
+                f"W{m.group(2)}", f"W{int(lesson_keys[0]):02d}")
+
+    # (8) 원본(워드/PDF)과 대조
+    if source_rows is not None:
+        src_by_key = {}
+        for d in source_rows:
+            src_by_key[(str(d["lesson_order_seq"]), str(d["page_order_seq"]))] = d
+        for seq, lrows in lessons.items():
+            vocab_rows = [(r, v) for r, v in lrows if _s(v["act_code"]).strip() == VOCAB_ACT_CODE]
+            src_count = sum(1 for k in src_by_key if k[0] == seq)
+            if src_count == 0:
+                add("-", "-", "경고", f"원본에서 Week {seq} 회차를 찾지 못해 대조를 건너뜁니다.")
+                continue
+            if src_count != len(vocab_rows):
+                add("-", "-", "오류", f"Week {seq} 단어 수가 원본({src_count}개)과 다릅니다.",
+                    f"{len(vocab_rows)}개", f"{src_count}개")
+            for r, v in vocab_rows:
+                src = src_by_key.get((seq, _s(v["page_order_seq"]).strip()))
+                if not src:
+                    continue
+                for col in ["vocabulary", "vocabulary_kor", "vocabulary_excep"]:
+                    excel_val = normalize_spaces(_s(v[col]))
+                    src_val = normalize_spaces(str(src.get(col, "")))
+                    if excel_val != src_val:
+                        add(r, col, "경고", "원본과 내용이 다릅니다. (의도한 수정인지 확인)", excel_val, src_val)
+
+    return issues
+
+def apply_auto_fixes(file_bytes, issues, revision_style):
+    """자동수정 가능한 문제를 고치고, 고친 셀에 수정 차수 서식(바탕색+붉은 글씨)을 입힙니다."""
+    wb = load_workbook(io.BytesIO(file_bytes))
+    ws = wb["원고작성"]
+    col_idx = {name: i + 1 for i, name in enumerate(FINAL_COLS)}
+    fill, font_color = revision_style
+
+    # 같은 셀에 여러 수정(공백 + 파일명)이 겹치면 마지막(파일명 규칙) 값이 적용됩니다.
+    fixes = {}
+    for it in issues:
+        if it["자동수정"] and isinstance(it["행"], int):
+            fixes[(it["행"], it["열"])] = it["제안값"]
+
+    for (r, col), value in fixes.items():
+        cell = ws.cell(row=r, column=col_idx[col])
+        cell.value = value if value != "" else None
+        cell.fill = copy(fill)
+        new_font = copy(cell.font)
+        new_font.color = copy(font_color)
+        cell.font = new_font
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), len(fixes)
+
+
+# ==========================================================================
+# 7. MP3 만들기 (탭3) - 기존 Colab 코드의 규칙을 그대로 옮김
+# ==========================================================================
+DEFAULT_TTS = {
+    "VOICE": "en-US-AriaNeural",
+    "RATE": "-10%",
+    "PITCH": "+0Hz",
+    "REPEAT_COUNT": 1,
+    "CONCURRENCY": 2,
+    "SLEEP_MS": 500,
+    "MAX_WORDS": 120,
+    "BITRATE": "32k",
+}
+LOG_FILE = "build_log.csv"
+CLEAN_EXCEL = "정리된_단어목록.xlsx"
+
+def make_speech_text(raw_word):
+    """기존 Colab 코드의 발음 문장 규칙 + 하이픈을 띄어 읽도록 한 줄 추가"""
+    base_text = re.sub(r'\.mp3$', '', raw_word, flags=re.IGNORECASE).strip()
+    base_text = base_text.replace('-', ' ')   # 추가: mass-produce -> mass produce
+    clean_text_only = re.sub(r'[^a-zA-Z0-9\s_]', '', base_text)
+    speech_text = clean_text_only.replace('_', ' ')
+    speech_text = re.sub(r'\s+', ' ', speech_text).strip()
+    speech_text = re.sub(r'\bA\b', 'A.', speech_text)
+    return speech_text
+
+def read_vocab_items(file_bytes):
+    """엑셀의 단어 행을 읽어옵니다. 파일명은 vocabulary_sound 열을 그대로 사용합니다."""
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="원고작성", dtype=str).fillna("")
+    df = df[df["act_code"].str.strip() == VOCAB_ACT_CODE]
+    items = []
+    for idx, row in df.iterrows():
+        raw_word = normalize_spaces(row["vocabulary"])
+        filename = normalize_spaces(row["vocabulary_sound"])
+        if not raw_word or not filename:
+            continue
+        items.append({
+            "idx": len(items),
+            "orig_word": raw_word,
+            "speech_text": make_speech_text(raw_word),
+            "final_filename": filename,
+        })
+    return items
+
+def get_ffmpeg():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+def reencode(ffmpeg, src, dst, bitrate):
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", src, "-b:a", bitrate, dst], check=True)
+
+async def convert_word(item, semaphore, log_data, cfg, out_dir, ffmpeg, on_done):
+    import edge_tts
+    async with semaphore:
+        speech_text = item['speech_text']
+        filename = item['final_filename']
+        filepath = os.path.join(out_dir, filename)
+        tmp_path = filepath + ".tmp.mp3"
+
+        single_text = speech_text if speech_text.endswith('.') else f"{speech_text}."
+        text_to_speak = " ".join([single_text] * cfg["REPEAT_COUNT"])
+
+        start_time = time.time()
+        last_error = ""
+        success = False
+
+        for attempt in range(3):
+            try:
+                communicate = edge_tts.Communicate(text=text_to_speak, voice=cfg["VOICE"],
+                                                   rate=cfg["RATE"], pitch=cfg["PITCH"])
+                await communicate.save(tmp_path)
+                if os.path.getsize(tmp_path) == 0:
+                    raise RuntimeError("빈 오디오 수신 (0 bytes)")
+                await asyncio.to_thread(reencode, ffmpeg, tmp_path, filepath, cfg["BITRATE"])
+                success = True
+                break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                await asyncio.sleep(2 * (attempt + 1))
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        if not success and os.path.exists(filepath):
+            os.remove(filepath)
+
+        status = "Success" if success else f"Error: {last_error}"
+        log_data.append([item['idx'] + 1, item['orig_word'], speech_text, filename, status,
+                         f"{time.time() - start_time:.2f}s"])
+        on_done(item, success)
+        await asyncio.sleep(cfg["SLEEP_MS"] / 1000.0)
+
+async def run_tts(items, cfg, out_dir, ffmpeg, on_done):
+    semaphore = asyncio.Semaphore(cfg["CONCURRENCY"])
+    log_data = []
+    await asyncio.gather(*[convert_word(it, semaphore, log_data, cfg, out_dir, ffmpeg, on_done) for it in items])
+    return log_data
+
+def check_mp3_files(items, out_dir, bitrate, min_sec, max_sec):
+    """만들어진 mp3를 엑셀 기준으로 검수합니다."""
+    from mutagen.mp3 import MP3
+    expected_kbps = int(re.sub(r'\D', '', bitrate) or 0)
+    rows = []
+    for it in items:
+        fn = it["final_filename"]
+        path = os.path.join(out_dir, fn)
+        problems = []
+        size = os.path.getsize(path) if os.path.exists(path) else None
+        kbps = length = sr = None
+        if size is None:
+            problems.append("파일 없음")
+        elif size == 0:
+            problems.append("0KB")
+        else:
+            try:
+                info = MP3(path).info
+                kbps = round(info.bitrate / 1000)
+                length = round(info.length, 2)
+                sr = info.sample_rate
+                if expected_kbps and kbps != expected_kbps:
+                    problems.append(f"비트레이트 {kbps}k (기준 {expected_kbps}k)")
+                if length < min_sec or length > max_sec:
+                    problems.append(f"길이 {length}초 (기준 {min_sec}~{max_sec}초)")
+            except Exception as e:
+                problems.append(f"mp3 읽기 실패: {e}")
+        if not re.fullmatch(r'[A-Za-z0-9_]+\.mp3', fn):
+            problems.append("파일명에 허용되지 않는 문자")
+        rows.append({
+            "파일명": fn, "단어": it["orig_word"], "크기(KB)": round(size / 1024, 1) if size else 0,
+            "비트레이트(kbps)": kbps, "길이(초)": length, "샘플레이트": sr,
+            "결과": "통과" if not problems else " / ".join(problems),
+        })
+    created = set(os.listdir(out_dir))
+    extras = sorted(created - {it["final_filename"] for it in items})
+    return pd.DataFrame(rows), extras
+
+def build_mp3_zip(items, log_data, out_dir):
+    df_result = pd.DataFrame(log_data, columns=["번호", "원본_단어", "정제된_발음문장", "생성된_파일명", "상태", "소요시간"])
+    df_result = df_result.sort_values(by="번호").reset_index(drop=True)
+    log_bytes = df_result.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    clean_buf = io.BytesIO()
+    df_result[["생성된_파일명"]].to_excel(clean_buf, index=False, engine='openpyxl')
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w') as zf:
+        for it in items:
+            path = os.path.join(out_dir, it["final_filename"])
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                zf.write(path, arcname=os.path.join("ContentsFiles", it["final_filename"]))
+        zf.writestr(LOG_FILE, log_bytes)
+        zf.writestr(CLEAN_EXCEL, clean_buf.getvalue())
+    return zip_buf.getvalue(), df_result
+
+
+# ==========================================================================
+# 8. Streamlit UI
+# ==========================================================================
+st.set_page_config(page_title="단어 원고 · 검수 · MP3 통합 도구", layout="wide")
+st.title("📑 단어 원고 · 검수 · MP3 통합 도구")
+
+# 사이드바 설정 (기존과 동일)
 with st.sidebar:
     st.header("⚙️ 고정값 설정")
     service_code = st.text_input("service_code", "SVC170")
@@ -494,89 +928,271 @@ with st.sidebar:
     file_date = st.date_input("파일명 날짜", value=datetime.date.today())
     date_str = file_date.strftime("%y%m%d")
 
-# 중요: 여기서 uploaded_file 변수가 정의됩니다!
-uploaded_file = st.file_uploader("워드(.docx) 또는 PDF(.pdf) 파일을 업로드하세요", type=["docx", "pdf"])
+tab1, tab2, tab3 = st.tabs(["① 엑셀 만들기", "② 엑셀 검수", "③ MP3 만들기"])
 
-# 변수가 정의된 이후에 사용합니다.
-if uploaded_file is not None:
-    file_ext = uploaded_file.name.lower().rsplit(".", 1)[-1]
+# --------------------------------------------------------------------------
+# 탭 1: 엑셀 만들기 (기존 기능 그대로)
+# --------------------------------------------------------------------------
+with tab1:
+    uploaded_file = st.file_uploader("워드(.docx) 또는 PDF(.pdf) 파일을 업로드하세요", type=["docx", "pdf"], key="src_upload")
 
-    if file_ext == "pdf":
-        parsed_data, raw_texts = parse_pdf_content(uploaded_file)
-        # 콜론 기반(word: 뜻) 형식으로 하나도 못 찾으면, 품사 표기형(word 품사. 뜻)으로 재시도
-        if not parsed_data:
-            uploaded_file.seek(0)
-            parsed_data, raw_texts = parse_pdf_content_pos_style(uploaded_file)
-    else:
-        parsed_data, raw_texts = parse_word_content(uploaded_file)
-        # 기본 형식(단어: 뜻)으로 하나도 못 찾으면, 용어집(Glossary) 형식으로 재시도
-        if not parsed_data:
-            uploaded_file.seek(0)
-            parsed_data, raw_texts = parse_word_content_glossary_style(uploaded_file)
-    
-    if parsed_data:
-        df = pd.DataFrame(parsed_data)
-        
-        # 고정값 채우기
-        df['service_code'] = service_code
-        df['track_code'] = track_code
-        # top_cors_id는 템플릿처럼 숫자면 숫자 그대로 기입
+    if uploaded_file is not None:
+        parsed_data, raw_texts = parse_source_file(uploaded_file)
+
+        if parsed_data:
+            df = pd.DataFrame(parsed_data)
+
+            df['service_code'] = service_code
+            df['track_code'] = track_code
+            try:
+                df['top_cors_id'] = int(top_cors_id)
+            except (ValueError, TypeError):
+                df['top_cors_id'] = top_cors_id
+            df['level_code'] = level_code
+            df['component_code'] = component_code
+            df['book_code'] = book_code
+            df['act_code'] = "RSV_ACT002"
+            df['act_name'] = act_name
+
+            df_final = df.reindex(columns=FINAL_COLS).fillna("")
+
+            st.success("✅ 분석 완료!")
+            st.dataframe(df_final)
+
+            excel_bytes_all = build_excel_bytes(df_final)
+            all_file_name = f"{file_name_prefix}_{date_str}.xlsx"
+
+            st.download_button(
+                label="📊 전체 결과물 다운로드 (모든 주차 통합)",
+                data=excel_bytes_all,
+                file_name=all_file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            st.subheader("📅 주차별 다운로드")
+
+            week_numbers = sorted(df_final["lesson_order_seq"].unique())
+            zip_buffer = io.BytesIO()
+
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for week_num in week_numbers:
+                    week_df = df_final[df_final["lesson_order_seq"] == week_num]
+                    week_bytes = build_excel_bytes(week_df)
+                    week_file_name = f"{file_name_prefix}_W{int(week_num):02d}_{date_str}.xlsx"
+                    zf.writestr(week_file_name, week_bytes)
+
+                    st.download_button(
+                        label=f"⬇️ Week {int(week_num):02d} 다운로드 ({len(week_df)}개 단어)",
+                        data=week_bytes,
+                        file_name=week_file_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"week_download_{week_num}"
+                    )
+
+            st.download_button(
+                label="🗂️ 주차별 파일 전체 ZIP으로 한꺼번에 다운로드",
+                data=zip_buffer.getvalue(),
+                file_name=f"{file_name_prefix}_ALL_{date_str}.zip",
+                mime="application/zip"
+            )
+        else:
+            st.warning("단어를 찾지 못했습니다. 파일 형식을 확인하거나 디버그 모드를 켜보세요.")
+
+        if show_debug:
+            with st.expander("🔍 디버그 데이터"):
+                for i, txt in enumerate(raw_texts):
+                    st.text(f"L{i+1}: {txt}")
+
+# --------------------------------------------------------------------------
+# 탭 2: 엑셀 검수
+# --------------------------------------------------------------------------
+with tab2:
+    st.markdown("엑셀을 올리면 문서 작성 규정과 파일명 규칙을 자동으로 검사합니다. "
+                "자동으로 고칠 수 있는 항목(불필요한 띄어쓰기, mp3 파일명)은 수정본을 내려받을 수 있고, "
+                "고친 셀에는 **수정 차수 서식(바탕색 + 붉은색 글씨)**이 입혀집니다.")
+
+    review_files = st.file_uploader("검수할 엑셀(.xlsx) 파일 (여러 개 가능)", type=["xlsx"],
+                                    accept_multiple_files=True, key="review_upload")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        compare_source = st.file_uploader("(선택) 원본 워드/PDF와 대조", type=["docx", "pdf"], key="review_source")
+    with c2:
+        revision_styles = load_revision_styles()
+        revision_label = st.selectbox("자동 수정 시 표시할 수정 차수", list(revision_styles.keys()))
+        compare_fixed = st.checkbox("사이드바 고정값과도 비교", value=False,
+                                    help="사이드바에 이번 교재의 고정값을 입력해둔 경우에만 켜세요.")
+
+    if review_files:
+        source_rows = None
+        if compare_source is not None:
+            source_rows, _ = parse_source_file(compare_source)
+            if not source_rows:
+                st.warning("원본 파일에서 단어를 찾지 못해 원본 대조는 건너뜁니다.")
+                source_rows = None
+
+        expected_fixed = None
+        if compare_fixed:
+            expected_fixed = {
+                "service_code": service_code, "track_code": track_code, "top_cors_id": top_cors_id,
+                "level_code": level_code, "component_code": component_code, "book_code": book_code,
+                "act_name": act_name,
+            }
+
+        all_issues = []
+        fixed_outputs = []
+        for f in review_files:
+            file_bytes = f.getvalue()
+            issues = check_workbook(f.name, file_bytes, source_rows, expected_fixed)
+            all_issues.extend(issues)
+            if any(it["자동수정"] for it in issues):
+                fixed_bytes, n = apply_auto_fixes(file_bytes, issues, revision_styles[revision_label])
+                fixed_outputs.append((f.name, fixed_bytes, n))
+
+        st.subheader("📋 검수 결과")
+        summary = []
+        for f in review_files:
+            f_issues = [i for i in all_issues if i["파일"] == f.name]
+            summary.append({
+                "파일": f.name,
+                "오류": sum(1 for i in f_issues if i["수준"] == "오류"),
+                "경고": sum(1 for i in f_issues if i["수준"] == "경고"),
+                "자동수정 가능": sum(1 for i in f_issues if i["자동수정"]),
+                "판정": "✅ 통과" if not any(i["수준"] == "오류" for i in f_issues) else "❌ 수정 필요",
+            })
+        st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+
+        if all_issues:
+            df_issues = pd.DataFrame(all_issues)
+            level_filter = st.multiselect("표시할 수준", ["오류", "경고"], default=["오류", "경고"])
+            st.dataframe(df_issues[df_issues["수준"].isin(level_filter)], hide_index=True, use_container_width=True)
+
+            report_buf = io.BytesIO()
+            df_issues.to_excel(report_buf, index=False, engine="openpyxl")
+            st.download_button("📝 검수 보고서 다운로드 (.xlsx)", report_buf.getvalue(),
+                               file_name=f"검수보고서_{datetime.date.today():%y%m%d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.success("발견된 문제가 없습니다! 🎉")
+
+        if fixed_outputs:
+            st.subheader("🛠️ 자동 수정본")
+            if len(fixed_outputs) == 1:
+                name, data, n = fixed_outputs[0]
+                st.download_button(f"⬇️ {name} 수정본 ({n}개 셀 수정)", data, file_name=name,
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                zbuf = io.BytesIO()
+                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for name, data, n in fixed_outputs:
+                        zf.writestr(name, data)
+                st.download_button(f"⬇️ 수정본 {len(fixed_outputs)}개 ZIP 다운로드", zbuf.getvalue(),
+                                   file_name=f"수정본_{datetime.date.today():%y%m%d}.zip", mime="application/zip")
+            st.caption("수정본은 원래 파일명 그대로 저장됩니다. 문서개정 시트의 개정 이력은 직접 기입해주세요.")
+
+# --------------------------------------------------------------------------
+# 탭 3: MP3 만들기 + 파일명/규격 검수
+# --------------------------------------------------------------------------
+with tab3:
+    st.markdown("검수를 마친 엑셀을 올리면 **vocabulary_sound 열의 파일명 그대로** mp3를 만들고, "
+                "만든 뒤 개수·파일명·용량·비트레이트·길이를 자동으로 검사합니다.")
+
+    with st.expander("⚙️ 음성 설정 (기본 목소리: en-US-AriaNeural)"):
+        cfg = dict(DEFAULT_TTS)
+        cfg["VOICE"] = st.text_input("VOICE", DEFAULT_TTS["VOICE"])
+        cfg["RATE"] = st.text_input("RATE", DEFAULT_TTS["RATE"])
+        cfg["PITCH"] = st.text_input("PITCH", DEFAULT_TTS["PITCH"])
+        cfg["REPEAT_COUNT"] = st.number_input("REPEAT_COUNT", 1, 5, DEFAULT_TTS["REPEAT_COUNT"])
+        cfg["CONCURRENCY"] = st.number_input("CONCURRENCY (동시 처리 수)", 1, 5, DEFAULT_TTS["CONCURRENCY"])
+        cfg["SLEEP_MS"] = st.number_input("SLEEP_MS (요청 사이 대기, ms)", 0, 5000, DEFAULT_TTS["SLEEP_MS"])
+        cfg["MAX_WORDS"] = st.number_input("MAX_WORDS", 1, 1000, DEFAULT_TTS["MAX_WORDS"])
+        cfg["BITRATE"] = st.text_input("BITRATE", DEFAULT_TTS["BITRATE"])
+        st.markdown("**mp3 검수 기준**")
+        min_sec = st.number_input("최소 길이(초)", 0.0, 60.0, 0.3, step=0.1)
+        max_sec = st.number_input("최대 길이(초)", 0.5, 120.0, 15.0, step=0.5)
+
+    mp3_excel = st.file_uploader("mp3를 만들 엑셀(.xlsx) 파일", type=["xlsx"], key="mp3_upload")
+
+    if mp3_excel is not None:
+        file_bytes = mp3_excel.getvalue()
+        file_stem = os.path.splitext(mp3_excel.name)[0]
+
+        # 시작 전 사전 점검: 파일명 관련 오류가 있으면 먼저 알려줌
+        pre_issues = [i for i in check_workbook(mp3_excel.name, file_bytes)
+                      if i["수준"] == "오류" and i["열"] in ("vocabulary", "vocabulary_sound", "-")]
         try:
-            df['top_cors_id'] = int(top_cors_id)
-        except (ValueError, TypeError):
-            df['top_cors_id'] = top_cors_id
-        df['level_code'] = level_code
-        df['component_code'] = component_code
-        df['book_code'] = book_code
-        df['act_code'] = "RSV_ACT002"
-        df['act_name'] = act_name
-        
-        # 컬럼 순서 재배치 (템플릿 헤더 순서와 동일)
-        df_final = df.reindex(columns=FINAL_COLS).fillna("")
+            items = read_vocab_items(file_bytes)
+        except Exception as e:
+            items = []
+            st.error(f"엑셀을 읽을 수 없습니다: {e}")
 
-        st.success("✅ 분석 완료!")
-        st.dataframe(df_final)
+        if items:
+            if len(items) > cfg["MAX_WORDS"]:
+                st.warning(f"단어가 {len(items)}개라 MAX_WORDS({cfg['MAX_WORDS']})까지만 만듭니다.")
+                items = items[:int(cfg["MAX_WORDS"])]
 
-        # 전체 결과물(모든 주차 통합) 엑셀
-        excel_bytes_all = build_excel_bytes(df_final)
-        all_file_name = f"{file_name_prefix}_{date_str}.xlsx"
+            st.write(f"단어 **{len(items)}개**를 찾았습니다.")
+            with st.expander("읽을 문장과 파일명 미리보기"):
+                st.dataframe(pd.DataFrame([{"단어": i["orig_word"], "읽을 문장": i["speech_text"],
+                                            "파일명": i["final_filename"]} for i in items]),
+                             hide_index=True, use_container_width=True)
 
-        st.download_button(
-            label="📊 전체 결과물 다운로드 (모든 주차 통합)",
-            data=excel_bytes_all,
-            file_name=all_file_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            proceed = True
+            if pre_issues:
+                st.error(f"파일명/단어 관련 오류가 {len(pre_issues)}건 있습니다. ② 엑셀 검수 탭에서 먼저 확인하세요.")
+                st.dataframe(pd.DataFrame(pre_issues)[["행", "열", "내용", "현재값", "제안값"]], hide_index=True)
+                proceed = st.checkbox("오류를 확인했고, 그래도 진행합니다.")
 
-        # 주차별 파일 생성 (개별 다운로드 + ZIP 일괄 다운로드)
-        st.subheader("📅 주차별 다운로드")
+            ffmpeg = get_ffmpeg()
+            if not ffmpeg:
+                st.error("ffmpeg를 찾을 수 없습니다. `pip install imageio-ffmpeg`를 실행해주세요.")
+                proceed = False
 
-        week_numbers = sorted(df_final["lesson_order_seq"].unique())
-        zip_buffer = io.BytesIO()
+            if st.button("🎙️ MP3 만들기 시작", type="primary", disabled=not proceed):
+                out_dir = tempfile.mkdtemp(prefix="audio_")
+                progress = st.progress(0.0, text="변환 준비 중...")
+                status_box = st.empty()
+                counter = {"done": 0, "fail": 0}
 
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for week_num in week_numbers:
-                week_df = df_final[df_final["lesson_order_seq"] == week_num]
-                week_bytes = build_excel_bytes(week_df)
-                week_file_name = f"{file_name_prefix}_W{int(week_num):02d}_{date_str}.xlsx"
-                zf.writestr(week_file_name, week_bytes)
+                def on_done(item, success):
+                    counter["done"] += 1
+                    if not success:
+                        counter["fail"] += 1
+                    progress.progress(counter["done"] / len(items),
+                                      text=f"{counter['done']}/{len(items)} 완료 (실패 {counter['fail']}개)")
+                    status_box.caption(("✅ " if success else "❌ ") + item["final_filename"])
 
-                st.download_button(
-                    label=f"⬇️ Week {int(week_num):02d} 다운로드 ({len(week_df)}개 단어)",
-                    data=week_bytes,
-                    file_name=week_file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"week_download_{week_num}"
-                )
+                log_data = asyncio.run(run_tts(items, cfg, out_dir, ffmpeg, on_done))
+                df_check, extras = check_mp3_files(items, out_dir, cfg["BITRATE"], min_sec, max_sec)
+                zip_bytes, df_log = build_mp3_zip(items, log_data, out_dir)
+                shutil.rmtree(out_dir, ignore_errors=True)
 
-        st.download_button(
-            label="🗂️ 주차별 파일 전체 ZIP으로 한꺼번에 다운로드",
-            data=zip_buffer.getvalue(),
-            file_name=f"{file_name_prefix}_ALL_{date_str}.zip",
-            mime="application/zip"
-        )
-    
-    if show_debug:
-        with st.expander("🔍 디버그 데이터"):
-            for i, txt in enumerate(raw_texts):
-                st.text(f"L{i+1}: {txt}")
+                st.session_state["mp3_result"] = {
+                    "zip": zip_bytes, "zip_name": f"{file_stem}.zip",
+                    "check": df_check, "extras": extras, "log": df_log, "total": len(items),
+                }
+
+    result = st.session_state.get("mp3_result")
+    if result:
+        st.subheader("🔎 MP3 검수 결과")
+        df_check = result["check"]
+        n_pass = int((df_check["결과"] == "통과").sum())
+        n_fail = result["total"] - n_pass
+
+        if n_fail == 0:
+            st.success(f"전체 {result['total']}개 모두 통과했습니다! 🎉")
+        else:
+            st.error(f"{result['total']}개 중 {n_fail}개에 문제가 있습니다. 문제 있는 파일은 ZIP에서 빠지거나 확인이 필요합니다.")
+            errors = result["log"][result["log"]["상태"] != "Success"]
+            if len(errors) and errors["상태"].str.contains("403").all():
+                st.warning("모든 실패가 403 에러입니다. edge-tts 서버가 막힌 상태일 수 있습니다. "
+                           "`python -m pip install --upgrade edge-tts`로 업데이트한 뒤 다시 시도해보세요.")
+        if result["extras"]:
+            st.warning(f"엑셀에 없는 파일이 생성되었습니다: {', '.join(result['extras'])}")
+
+        st.dataframe(df_check, hide_index=True, use_container_width=True)
+        with st.expander("변환 로그 (build_log.csv 내용)"):
+            st.dataframe(result["log"], hide_index=True, use_container_width=True)
+
+        st.download_button(f"📦 {result['zip_name']} 다운로드", result["zip"],
+                           file_name=result["zip_name"], mime="application/zip", type="primary")
