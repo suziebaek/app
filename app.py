@@ -129,6 +129,13 @@ def resolve_week_mode(file_name, selected_mode, level_code=""):
     return "seq", ("파일명에서 홀수/짝수 교재명을 찾지 못해 회차 번호 그대로(1, 2, 3, …) 배정했습니다. "
                    "필요하면 사이드바에서 직접 선택하세요.")
 
+def derive_file_prefix(level_code):
+    """level_code로 파일명 접두어를 만듭니다. 예) TO_R_H_AU -> TOH_AU_Recap_S, TO_R_T_AU -> TOT_AU_Recap_S"""
+    parts = [p for p in str(level_code).strip().upper().split("_") if p]
+    if len(parts) >= 4 and parts[0] == "TO":
+        return f"TO{parts[2]}_{parts[3]}_Recap_S"
+    return "TOT_AU_Recap_S"
+
 def remap_weeks(data, mode):
     if mode == "seq":
         return data
@@ -1059,8 +1066,11 @@ with st.sidebar:
     week_mode = WEEK_MODES[week_mode_label]
 
     st.header("📁 파일명 설정")
-    st.caption("예: TOT_AU_Recap_S_W04_260731.xlsx")
-    file_name_prefix = st.text_input("파일명 접두어 (주차/날짜 앞부분)", "TOT_AU_Recap_S")
+    st.caption("접두어는 level_code에 맞춰 자동으로 채워집니다. (예: TO_R_H_AU → TOH_AU_Recap_S) 필요하면 직접 고치세요.")
+    suggested_prefix = derive_file_prefix(level_code)
+    # key에 추천값을 넣어서, level_code를 바꾸면 접두어 칸도 새 추천값으로 바뀌도록 함
+    file_name_prefix = st.text_input("파일명 접두어 (주차/날짜 앞부분)", suggested_prefix,
+                                     key=f"file_name_prefix_{suggested_prefix}").strip()
     file_date = st.date_input("파일명 날짜", value=datetime.date.today())
     date_str = file_date.strftime("%y%m%d")
 
@@ -1114,11 +1124,16 @@ with tab1:
             excel_bytes_all = build_excel_bytes(df_final)
             all_file_name = f"{file_name_prefix}_{date_str}.xlsx"
 
+            zip_file_name = f"{file_name_prefix}_ALL_{date_str}.zip"
+            st.info(f"📁 저장될 파일명: **{file_name_prefix}_W##_{date_str}.xlsx** "
+                    f"(접두어를 고친 뒤에는 Enter를 눌러 이 문구가 바뀐 것을 확인하고 내려받으세요)")
+
             st.download_button(
-                label="📊 전체 결과물 다운로드 (모든 주차 통합)",
+                label=f"📊 전체 결과물 다운로드 (모든 주차 통합) — {all_file_name}",
                 data=excel_bytes_all,
                 file_name=all_file_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"all_download_{all_file_name}_{hashlib.md5(excel_bytes_all).hexdigest()[:8]}"
             )
 
             st.subheader("📅 주차별 다운로드")
@@ -1134,7 +1149,7 @@ with tab1:
                     zf.writestr(week_file_name, week_bytes)
 
                     st.download_button(
-                        label=f"⬇️ Week {int(week_num):02d} 다운로드 ({len(week_df)}개 단어)",
+                        label=f"⬇️ Week {int(week_num):02d} 다운로드 ({len(week_df)}개 단어) — {week_file_name}",
                         data=week_bytes,
                         file_name=week_file_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1143,11 +1158,13 @@ with tab1:
                         key=f"week_download_{week_file_name}_{hashlib.md5(week_bytes).hexdigest()[:8]}"
                     )
 
+            zip_bytes = zip_buffer.getvalue()
             st.download_button(
-                label="🗂️ 주차별 파일 전체 ZIP으로 한꺼번에 다운로드",
-                data=zip_buffer.getvalue(),
-                file_name=f"{file_name_prefix}_ALL_{date_str}.zip",
-                mime="application/zip"
+                label=f"🗂️ 주차별 파일 전체 ZIP으로 한꺼번에 다운로드 — {zip_file_name}",
+                data=zip_bytes,
+                file_name=zip_file_name,
+                mime="application/zip",
+                key=f"zip_download_{zip_file_name}_{hashlib.md5(zip_bytes).hexdigest()[:8]}"
             )
         else:
             st.warning("단어를 찾지 못했습니다. 파일 형식을 확인하거나 디버그 모드를 켜보세요.")
