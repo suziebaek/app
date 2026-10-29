@@ -78,6 +78,22 @@ WEEK_MODES = {
 ODD_WEEK_BOOKS = ["SR", "CSR", "CR", "SCR"]     # 홀수 주차 (1, 3, 5, …)
 EVEN_WEEK_BOOKS = ["RP", "ARP", "URP"]          # 짝수 주차 (2, 4, 6, …)
 AUTO_WEEK_MODE = "auto"
+# 레슨 12개가 모두 있는 레벨은 교재와 상관없이 회차 번호 그대로(1~12주차) 배정합니다.
+FULL_LESSON_LEVELS = ["S", "T"]
+
+def detect_level(file_name, level_code=""):
+    """레벨을 찾습니다. 1순위: 사이드바 level_code의 세 번째 값 (예: TO_R_T_AU -> T)
+    2순위: 파일명 속 레벨 표기 (예: CSR_S1_Vocab.docx -> S, CR_H_Vocab.docx -> H)
+    돌려주는 값: (레벨 또는 None, 어디서 찾았는지)"""
+    parts = [p for p in str(level_code).strip().upper().split("_") if p]
+    if len(parts) >= 3 and re.fullmatch(r'[A-Z]', parts[2]):
+        return parts[2], "level_code"
+    stem = os.path.splitext(os.path.basename(file_name))[0]
+    for t in re.split(r'[_\s\-\.]+', stem):
+        m = re.fullmatch(r'([A-Za-z])\d*', t)
+        if m:
+            return m.group(1).upper(), "파일명"
+    return None, None
 
 def detect_book_week_mode(file_name):
     """파일명을 _ / 공백 / - 기준으로 나눠 교재명을 찾습니다.
@@ -93,11 +109,15 @@ def detect_book_week_mode(file_name):
         return "even", even[0]
     return None, None
 
-def resolve_week_mode(file_name, selected_mode):
-    """'자동'이면 파일명의 교재명으로 결정하고, 못 찾으면 '그대로'를 씁니다.
+def resolve_week_mode(file_name, selected_mode, level_code=""):
+    """'자동'이면 레벨(S/T는 그대로) -> 파일명의 교재명 순서로 결정하고, 못 찾으면 '그대로'를 씁니다.
     돌려주는 값: (실제 적용할 mode, 화면에 보여줄 설명)"""
     if selected_mode != AUTO_WEEK_MODE:
         return selected_mode, None
+    level, level_src = detect_level(file_name, level_code)
+    if level in FULL_LESSON_LEVELS:
+        return "seq", (f"{level} 레벨({level_src} 기준)은 레슨 12개가 모두 있어 "
+                       f"교재와 상관없이 회차 번호 그대로(1, 2, 3, …) 배정했습니다.")
     mode, book = detect_book_week_mode(file_name)
     if mode == "odd":
         return "odd", f"교재명 '{book}' → 홀수 주차(1, 3, 5, …)로 배정했습니다."
@@ -1033,7 +1053,8 @@ with st.sidebar:
     st.header("📅 주차 배정")
     week_mode_label = st.radio(
         "회차를 몇 주차로 넣을까요?", list(WEEK_MODES.keys()),
-        help="자동: 홀수 주 교재(" + ", ".join(ODD_WEEK_BOOKS) + "), 짝수 주 교재(" + ", ".join(EVEN_WEEK_BOOKS) + ")\n\n"
+        help="자동: " + "/".join(FULL_LESSON_LEVELS) + " 레벨은 그대로, 그 외 홀수 주 교재(" + ", ".join(ODD_WEEK_BOOKS)
+             + "), 짝수 주 교재(" + ", ".join(EVEN_WEEK_BOOKS) + ")\n\n"
              "홀수 주: CHAPTER 1 → W01, CHAPTER 2 → W03 …  /  짝수 주: CHAPTER 1 → W02, CHAPTER 2 → W04 …",
     )
     week_mode = WEEK_MODES[week_mode_label]
@@ -1053,7 +1074,7 @@ with tab1:
     uploaded_file = st.file_uploader("워드(.docx) 또는 PDF(.pdf) 파일을 업로드하세요", type=["docx", "pdf"], key="src_upload")
 
     if uploaded_file is not None:
-        applied_mode, mode_note = resolve_week_mode(uploaded_file.name, week_mode)
+        applied_mode, mode_note = resolve_week_mode(uploaded_file.name, week_mode, level_code)
         if mode_note:
             st.info("📅 " + mode_note)
         parsed_data, raw_texts = parse_source_file(uploaded_file, applied_mode)
@@ -1145,7 +1166,7 @@ with tab2:
     if review_files:
         source_rows = None
         if compare_source is not None:
-            src_mode, src_note = resolve_week_mode(compare_source.name, week_mode)
+            src_mode, src_note = resolve_week_mode(compare_source.name, week_mode, level_code)
             if src_note:
                 st.info("📅 원본 대조: " + src_note)
             source_rows, _ = parse_source_file(compare_source, src_mode)
