@@ -8,6 +8,7 @@ import re
 import os
 import zipfile
 import datetime
+import hashlib
 from copy import copy
 from openpyxl import load_workbook
 
@@ -34,6 +35,8 @@ def clean_filename(text):
     # 공백/하이픈은 언더바로 치환 (예: voice-assisted -> voice_assisted)
     text = re.sub(r'[\s\-]+', '_', text)
     text = re.sub(r'[^a-zA-Z0-9_]', '', text)
+    # 특수문자(⋯ 등)가 지워지면서 생긴 연속 언더바/앞뒤 언더바 정리 (예: one ⋯ at a time -> one_at_a_time)
+    text = re.sub(r'_+', '_', text).strip('_')
     # 대소문자는 vocabulary 원문 그대로 유지 (예: protect A from B -> protect_A_from_B.mp3)
     return text + ".mp3"
 
@@ -389,8 +392,7 @@ def parse_pdf_content(pdf_file):
     current_chapter_num = 1
     current_week_title = "Week 01/"
     current_week_num = 1
-    previous_entry_num = None
-    pending_heading = False
+    previous_entry_num = None   # 직전에 인식한 단어 번호
 
     # PDF 텍스트 추출 시 "01 word: 뜻   Syn: xxx" 처럼 번호가 마침표 없이
     # 붙는 형태와, 뜻과 Syn/Ant 사이가 한 칸 공백으로만 구분되는 경우가 많아
@@ -403,34 +405,22 @@ def parse_pdf_content(pdf_file):
     for line in lines:
         raw_texts.append(line)
 
-        # 챕터 감지 (Week 번호 연동, 페이지 하단에 챕터 번호가 반복 출력되는
-        # 문서도 있어 실제로 챕터가 바뀔 때만 카운터를 리셋합니다)
+        # 챕터 감지: "CHAPTER 3"처럼 번호가 붙은 표기가 지금보다 큰 번호일 때만 반영합니다.
+        # (페이지 하단 "CHAPTER 01 85" 같은 쪽 번호 표기가 반복되거나, 앞 단원 표기가
+        #  뒤늦게 나와도 회차가 되돌아가지 않도록)
         chapter_num = detect_chapter_number(line)
         if chapter_num is not None:
-            if chapter_num != current_week_num:
+            if chapter_num > current_week_num:
                 current_week_num = chapter_num
                 current_week_title = f"Week {current_week_num:02d}/"
                 current_chapter_num = 1
                 previous_entry_num = None
-            pending_heading = False
-            continue
-
-        # "Mastery" 같은 이름만 있는 단원 제목 (다음 단어 번호가 1이면 새 회차)
-        if is_section_heading(line):
-            pending_heading = True
             continue
 
         # 번호 + 단어: 뜻 [Syn/Ant: 유의어] 추출
         match = entry_pattern.match(line)
         if match:
             entry_num = int(re.match(r'^(\d{1,2})', line).group(1))
-            if pending_heading and previous_entry_num is not None and entry_num == 1 and previous_entry_num != 1:
-                current_week_num += 1
-                current_week_title = f"Week {current_week_num:02d}/"
-                current_chapter_num = 1
-            previous_entry_num = entry_num
-            pending_heading = False
-
             raw_word = expand_sb_sth(match.group(1).strip())
             rest = match.group(2).strip()
 
@@ -444,7 +434,16 @@ def parse_pdf_content(pdf_file):
                 meaning = rest
                 extra_info = ""
 
+            # 뜻에 한글이 있는 줄만 단어로 인정 (페이지 하단 "1 RP H (4).indd 82 ... 09:39" 같은 줄 제외)
             if re.search(r'[가-힣]', meaning):
+                # 단어 번호가 01로 다시 시작하면 새 회차
+                # ("CHAPTER" 번호가 따로 추출되지 않는 PDF, "MINI TEST", "Mastery" 같은 단원도 처리)
+                if previous_entry_num is not None and entry_num == 1 and previous_entry_num > 1:
+                    current_week_num += 1
+                    current_week_title = f"Week {current_week_num:02d}/"
+                    current_chapter_num = 1
+                previous_entry_num = entry_num
+
                 sound_file = clean_filename(raw_word)
 
                 data.append({
@@ -1097,6 +1096,19 @@ with tab1:
             df_final = df.reindex(columns=FINAL_COLS).fillna("")
 
             st.success("✅ 분석 완료!")
+
+            # 원본과 단어 수를 쉽게 맞춰볼 수 있도록 주차별 요약 표시
+            summary_rows = []
+            for wk, grp in df_final.groupby("lesson_order_seq", sort=True):
+                summary_rows.append({
+                    "주차": f"W{int(wk):02d}",
+                    "단어 수": len(grp),
+                    "첫 단어": grp["vocabulary"].iloc[0],
+                    "마지막 단어": grp["vocabulary"].iloc[-1],
+                })
+            st.markdown("**📊 주차별 단어 수** (원본의 단원별 마지막 번호와 같은지 확인하세요)")
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True)
+
             st.dataframe(df_final)
 
             excel_bytes_all = build_excel_bytes(df_final)
@@ -1126,7 +1138,9 @@ with tab1:
                         data=week_bytes,
                         file_name=week_file_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"week_download_{week_num}"
+                        # 파일명/내용이 바뀌면 새 버튼으로 인식되도록 key에 파일명과 내용 지문을 함께 넣음
+                        # (key가 주차 번호만이면, 접두어·날짜·주차 설정을 바꿔도 이전 파일명으로 내려받아지는 문제가 있었음)
+                        key=f"week_download_{week_file_name}_{hashlib.md5(week_bytes).hexdigest()[:8]}"
                     )
 
             st.download_button(
