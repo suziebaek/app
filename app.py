@@ -1048,7 +1048,7 @@ def apply_auto_fixes(file_bytes, issues, revision_style):
 # 7. MP3 만들기 (탭3) - 기존 Colab 코드의 규칙을 그대로 옮김
 # ==========================================================================
 DEFAULT_TTS = {
-    "VOICE": "en-US-AriaNeural",
+    "VOICE": "en-US-JennyNeural",
     "RATE": "-10%",
     "PITCH": "+0Hz",
     "REPEAT_COUNT": 1,
@@ -1435,7 +1435,7 @@ with tab3:
     st.markdown("검수를 마친 엑셀을 올리면 **vocabulary_sound 열의 파일명 그대로** mp3를 만들고, "
                 "만든 뒤 개수·파일명·용량·비트레이트·길이를 자동으로 검사합니다.")
 
-    with st.expander("⚙️ 음성 설정 (기본 목소리: en-US-AriaNeural)"):
+    with st.expander("⚙️ 음성 설정 (기본 목소리: en-US-JennyNeural)"):
         cfg = dict(DEFAULT_TTS)
         cfg["VOICE"] = st.text_input("VOICE", DEFAULT_TTS["VOICE"])
         cfg["RATE"] = st.text_input("RATE", DEFAULT_TTS["RATE"])
