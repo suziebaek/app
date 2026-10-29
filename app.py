@@ -409,19 +409,56 @@ def parse_pdf_content(pdf_file):
     tail_start_pattern = re.compile(r'\b(Syn|Ant)\s*:')
     syn_value_pattern = re.compile(r'\bSyn\s*:\s*(.+)$')
 
+    # 단원 제목/쪽 표기 감지
+    # - 쪽 하단 표기(예: "CHAPTER 01 85", "MINI TEST 02 81")는 무시합니다. (쪽 번호가 붙어 있음)
+    # - 단원 머리글(예: "CHAPTER 3", "CHAPTER" 다음 줄 "03 VOCAB LIST", "MINI TEST" 다음 줄 "01")은
+    #   다음 단원의 이름/번호 후보로만 기억해 두고, 실제 회차 번호는 "단어 번호가 01로 다시 시작"할 때 정합니다.
+    #   이렇게 하면 표기가 어디에 찍히든 회차가 건너뛰거나 되돌아가지 않습니다.
+    footer_pattern = re.compile(r"(?i)^(chapter|mini\s*test|unit|lesson)\s*\d{1,2}\s+\d{1,4}$")
+    header_pattern = re.compile(
+        r"(?i)^(chapter|ch\.?|mini\s*test|unit|lesson|review|mastery)\s*(\d{1,2})?\s*(?:[:\-–].*)?$")
+    numbered_kinds = ("CHAPTER", "UNIT", "LESSON")   # 이 단원들의 번호만 회차 번호로 사용
+
+    def norm_kind(k):
+        k = re.sub(r"\s+", " ", k.strip().upper().rstrip("."))
+        return "CHAPTER" if k == "CH" else k
+
+    last_lesson = 0          # 지금까지 만든 마지막 회차 번호
+    pending_label = None     # 다음 단원 이름 후보 (예: "CHAPTER 02")
+    pending_num = None       # 다음 단원 번호 후보 (CHAPTER/UNIT/LESSON만)
+    awaiting_kind = None     # "CHAPTER"처럼 번호 없이 나온 머리글 -> 다음 줄 앞 숫자를 번호로 사용
+    current_label = ""
+
     for line in lines:
         raw_texts.append(line)
 
-        # 챕터 감지: "CHAPTER 3"처럼 번호가 붙은 표기가 지금보다 큰 번호일 때만 반영합니다.
-        # (페이지 하단 "CHAPTER 01 85" 같은 쪽 번호 표기가 반복되거나, 앞 단원 표기가
-        #  뒤늦게 나와도 회차가 되돌아가지 않도록)
-        chapter_num = detect_chapter_number(line)
-        if chapter_num is not None:
-            if chapter_num > current_week_num:
-                current_week_num = chapter_num
-                current_week_title = f"Week {current_week_num:02d}/"
-                current_chapter_num = 1
-                previous_entry_num = None
+        if footer_pattern.match(line):
+            awaiting_kind = None
+            continue
+
+        if awaiting_kind:
+            m = re.match(r"^(\d{1,2})(?:\s|$)", line)
+            # 바로 다음 줄이 단어 줄(예: "01 judge one's worth: ...")이면 그 숫자는 단어 번호이므로 단원 번호로 쓰지 않음
+            if m and entry_pattern.match(line):
+                m = None
+            if m:
+                n = int(m.group(1))
+                pending_label = f"{awaiting_kind} {n:02d}"
+                pending_num = n if awaiting_kind in numbered_kinds else None
+            awaiting_kind = None
+            # 숫자 줄이 단어 줄일 수도 있으므로 아래 처리를 계속 진행
+
+        hm = header_pattern.match(line)
+        if hm and not re.search(r"[가-힣]", line):
+            kind = norm_kind(hm.group(1))
+            if hm.group(2):
+                n = int(hm.group(2))
+                pending_label = f"{kind} {n:02d}"
+                pending_num = n if kind in numbered_kinds else None
+            else:
+                awaiting_kind = kind
+                pending_label = kind
+                pending_num = None
             continue
 
         # 번호 + 단어: 뜻 [Syn/Ant: 유의어] 추출
@@ -443,12 +480,19 @@ def parse_pdf_content(pdf_file):
 
             # 뜻에 한글이 있는 줄만 단어로 인정 (페이지 하단 "1 RP H (4).indd 82 ... 09:39" 같은 줄 제외)
             if re.search(r'[가-힣]', meaning):
-                # 단어 번호가 01로 다시 시작하면 새 회차
-                # ("CHAPTER" 번호가 따로 추출되지 않는 PDF, "MINI TEST", "Mastery" 같은 단원도 처리)
-                if previous_entry_num is not None and entry_num == 1 and previous_entry_num > 1:
-                    current_week_num += 1
+                new_section = (previous_entry_num is None) or (entry_num == 1 and previous_entry_num > 1)
+                if new_section:
+                    # 머리글 번호가 있고 지금보다 크면 그 번호, 아니면 바로 다음 번호
+                    if pending_num is not None and pending_num > last_lesson:
+                        last_lesson = pending_num
+                    else:
+                        last_lesson += 1
+                    current_week_num = last_lesson
                     current_week_title = f"Week {current_week_num:02d}/"
                     current_chapter_num = 1
+                    current_label = pending_label or f"{last_lesson}번째 단원"
+                pending_label = None
+                pending_num = None
                 previous_entry_num = entry_num
 
                 sound_file = clean_filename(raw_word)
@@ -461,7 +505,8 @@ def parse_pdf_content(pdf_file):
                     "vocabulary_kor": meaning,
                     "vocabulary_sound": sound_file,
                     "vocabulary_excep": extra_info,
-                    "prompt": ""
+                    "prompt": "",
+                    "section_label": current_label,
                 })
                 current_chapter_num += 1
 
@@ -1109,9 +1154,10 @@ with tab1:
 
             # 원본과 단어 수를 쉽게 맞춰볼 수 있도록 주차별 요약 표시
             summary_rows = []
-            for wk, grp in df_final.groupby("lesson_order_seq", sort=True):
+            for wk, grp in df.groupby("lesson_order_seq", sort=True):
                 summary_rows.append({
                     "주차": f"W{int(wk):02d}",
+                    "원본 단원": grp["section_label"].iloc[0] if "section_label" in grp and grp["section_label"].iloc[0] else "-",
                     "단어 수": len(grp),
                     "첫 단어": grp["vocabulary"].iloc[0],
                     "마지막 단어": grp["vocabulary"].iloc[-1],
