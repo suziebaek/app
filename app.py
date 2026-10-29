@@ -661,6 +661,120 @@ import tempfile
 import subprocess
 import collections
 
+def _find_column_split(page):
+    """2단 편집 페이지의 가운데 세로 구분선 x좌표를 찾습니다. 없으면 페이지 가운데."""
+    w, h = page.width, page.height
+    candidates = []
+    for ln in list(page.lines) + list(page.rects):
+        x0, x1 = ln.get("x0", 0), ln.get("x1", 0)
+        top, bottom = ln.get("top", 0), ln.get("bottom", 0)
+        if abs(x1 - x0) < 2 and (bottom - top) > h * 0.3 and w * 0.35 < x0 < w * 0.65:
+            candidates.append(x0)
+    return sorted(candidates)[len(candidates) // 2] if candidates else w / 2
+
+
+def parse_pdf_glossary_style(pdf_file):
+    """번호 없는 2단 Glossary 형식 PDF (예: CTR "Visual Reference & Glossary")
+    한 항목의 구성:
+        단어(영어 한 줄)
+        뜻(한글 한 줄, 길면 다음 줄까지)
+        syn: 유의어들        (선택)
+        ant: 반의어들        (선택)
+        예문 / 연어 표현      (무시)
+    - 페이지를 가운데 구분선 기준으로 왼쪽 단 -> 오른쪽 단 순서로 읽습니다.
+      (그냥 읽으면 두 단의 글이 한 줄에 섞여서 단어와 뜻이 엇갈립니다)
+    - "CHAPTER 01 ..." 제목이 나올 때마다 회차가 바뀝니다.
+    - "한글 뜻 줄 바로 위의 짧은 영어 줄"만 단어로 인정하므로, 도식(Visual Reference) 글자는 들어오지 않습니다.
+    """
+    data = []
+    raw_texts = []
+    hangul = re.compile(r'[가-힣]')
+    syn_pat = re.compile(r'(?i)^syn\s*:\s*(.+)$')
+    ant_pat = re.compile(r'(?i)^ant\s*:')
+    footer_pat = re.compile(r'(?i)(\.indd\b|^\s*\d{1,4}\s*$|visual reference\s*&\s*glossary)')
+
+    lines = []
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            split_x = _find_column_split(page)
+            for bbox in [(0, 0, split_x, page.height), (split_x, 0, page.width, page.height)]:
+                try:
+                    text = page.crop(bbox).extract_text() or ""
+                except Exception:
+                    text = ""
+                for l in text.split("\n"):
+                    l = l.strip()
+                    if l:
+                        lines.append(l)
+
+    def is_word_line(l):
+        if hangul.search(l) or syn_pat.match(l) or ant_pat.match(l) or footer_pat.search(l):
+            return False
+        if l.endswith((".", ",", "/", ":", ";", "?", "!", "\u201d", '"')):
+            return False
+        if detect_chapter_number(l) is not None:
+            return False
+        return 0 < len(l.split()) <= 6
+
+    current_week_num = 0
+    current_chapter_num = 1
+    entry = None
+
+    def flush():
+        nonlocal entry, current_chapter_num
+        if entry and current_week_num > 0:
+            raw_word = expand_sb_sth(entry["word"])
+            data.append({
+                "lesson_title": f"Week {current_week_num:02d}/",
+                "lesson_order_seq": current_week_num,
+                "page_order_seq": current_chapter_num,
+                "vocabulary": raw_word,
+                "vocabulary_kor": entry["kor"],
+                "vocabulary_sound": clean_filename(raw_word),
+                "vocabulary_excep": expand_sb_sth(entry["syn"]),
+                "prompt": "",
+                "section_label": f"CHAPTER {current_week_num:02d}",
+            })
+            current_chapter_num += 1
+        entry = None
+
+    prev = ""
+    for line in lines:
+        raw_texts.append(line)
+        chapter_num = detect_chapter_number(line)
+        if chapter_num is not None and not footer_pat.search(line):
+            if chapter_num != current_week_num and chapter_num > current_week_num:
+                flush()
+                current_week_num = chapter_num
+                current_chapter_num = 1
+            prev = line
+            continue
+
+        if hangul.search(line):
+            if entry is not None and entry["stage"] == "kor":
+                # 뜻이 두 줄로 넘어간 경우 이어 붙임
+                entry["kor"] = f"{entry['kor']} {line}".strip()
+            elif is_word_line(prev):
+                flush()
+                entry = {"word": prev, "kor": line, "syn": "", "stage": "kor"}
+            prev = line
+            continue
+
+        if entry is not None:
+            m = syn_pat.match(line)
+            if m and entry["stage"] == "kor":
+                entry["syn"] = m.group(1).strip()
+                entry["stage"] = "syn"
+            elif ant_pat.match(line) and entry["stage"] in ("kor", "syn"):
+                entry["stage"] = "ant"
+            else:
+                entry["stage"] = "body"   # 예문/연어 표현 시작 -> 이후 한글 줄은 새 항목으로만 인정
+        prev = line
+
+    flush()
+    return data, raw_texts
+
+
 def parse_source_file(uploaded, week_mode="seq"):
     """워드/PDF를 기존 파서로 분석하고, 주차 배정 방식(그대로/홀수/짝수)을 적용합니다. (탭1, 탭2 공용)"""
     file_ext = uploaded.name.lower().rsplit(".", 1)[-1]
@@ -670,6 +784,10 @@ def parse_source_file(uploaded, week_mode="seq"):
         if not parsed_data:
             uploaded.seek(0)
             parsed_data, raw_texts = parse_pdf_content_pos_style(uploaded)
+        if not parsed_data:
+            # 번호 없는 2단 Glossary 형식 (예: CTR)
+            uploaded.seek(0)
+            parsed_data, raw_texts = parse_pdf_glossary_style(uploaded)
     else:
         parsed_data, raw_texts = parse_word_content(uploaded)
         if not parsed_data:
