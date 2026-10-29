@@ -54,6 +54,71 @@ def detect_chapter_number(line):
 def is_round_marker(line):
     return ROUND_LINE_PATTERN.match(line.strip()) is not None
 
+# 번호 없이 이름만 있는 단원 제목 감지 (예: "Mastery", "Review", "Final Test")
+# - 영문/숫자/공백 위주의 짧은 한 줄 (5단어 이하), 콜론·마침표·한글 없음
+# - 제목만으로는 새 회차로 보지 않고, 바로 다음 단어 번호가 1로 다시 시작될 때만 새 회차로 인정
+#   (예문 문장은 마침표로 끝나므로 제목으로 오인되지 않음)
+SECTION_HEADING_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9&'\- ]{1,40}$")
+
+def is_section_heading(line):
+    s = line.strip()
+    return bool(SECTION_HEADING_PATTERN.match(s)) and len(s.split()) <= 5
+
+# 주차 배정 방식: 원본 회차 번호 n을 그대로 / 홀수 주(2n-1) / 짝수 주(2n)로 바꿉니다.
+# 예) 홀수 주: CHAPTER 1 -> W01, CHAPTER 2 -> W03, ... / 짝수 주: CHAPTER 1 -> W02, CHAPTER 2 -> W04, ...
+WEEK_MODES = {
+    "자동 (파일명의 교재명으로 판단)": "auto",
+    "그대로 (1, 2, 3, …)": "seq",
+    "홀수 주 (1, 3, 5, …)": "odd",
+    "짝수 주 (2, 4, 6, …)": "even",
+}
+
+# 교재명(파일명 맨 앞 등)으로 주차 배정 방식을 자동 결정합니다.
+# 새 교재가 생기면 아래 목록에 교재명만 추가하면 됩니다.
+ODD_WEEK_BOOKS = ["SR", "CSR", "CR", "SCR"]     # 홀수 주차 (1, 3, 5, …)
+EVEN_WEEK_BOOKS = ["RP", "ARP", "URP"]          # 짝수 주차 (2, 4, 6, …)
+AUTO_WEEK_MODE = "auto"
+
+def detect_book_week_mode(file_name):
+    """파일명을 _ / 공백 / - 기준으로 나눠 교재명을 찾습니다.
+    예) CSR_E1_Vocab_List_초안.docx -> CSR -> 홀수 주
+    돌려주는 값: (mode 또는 None, 찾은 교재명 또는 None)"""
+    stem = os.path.splitext(os.path.basename(file_name))[0]
+    tokens = [t.upper() for t in re.split(r'[_\s\-\.]+', stem) if t]
+    odd = [t for t in tokens if t in ODD_WEEK_BOOKS]
+    even = [t for t in tokens if t in EVEN_WEEK_BOOKS]
+    if odd and not even:
+        return "odd", odd[0]
+    if even and not odd:
+        return "even", even[0]
+    return None, None
+
+def resolve_week_mode(file_name, selected_mode):
+    """'자동'이면 파일명의 교재명으로 결정하고, 못 찾으면 '그대로'를 씁니다.
+    돌려주는 값: (실제 적용할 mode, 화면에 보여줄 설명)"""
+    if selected_mode != AUTO_WEEK_MODE:
+        return selected_mode, None
+    mode, book = detect_book_week_mode(file_name)
+    if mode == "odd":
+        return "odd", f"교재명 '{book}' → 홀수 주차(1, 3, 5, …)로 배정했습니다."
+    if mode == "even":
+        return "even", f"교재명 '{book}' → 짝수 주차(2, 4, 6, …)로 배정했습니다."
+    return "seq", ("파일명에서 홀수/짝수 교재명을 찾지 못해 회차 번호 그대로(1, 2, 3, …) 배정했습니다. "
+                   "필요하면 사이드바에서 직접 선택하세요.")
+
+def remap_weeks(data, mode):
+    if mode == "seq":
+        return data
+    new_data = []
+    for d in data:
+        n = int(d["lesson_order_seq"])
+        week = 2 * n - 1 if mode == "odd" else 2 * n
+        nd = dict(d)
+        nd["lesson_order_seq"] = week
+        nd["lesson_title"] = f"Week {week:02d}/"
+        new_data.append(nd)
+    return new_data
+
 # 2. 워드 파싱 함수
 def parse_word_content(docx_file):
     doc = Document(docx_file)
@@ -97,6 +162,7 @@ def parse_word_content(docx_file):
     use_round_reset_fallback = any(is_round_marker(l) for l in paragraphs)
     previous_entry_num = None
     just_saw_explicit_marker = False
+    pending_heading = False   # 직전 줄이 "Mastery" 같은 단원 제목이었는지
 
     for token_type, line in tokens:
         if token_type == "section_break":
@@ -106,6 +172,7 @@ def parse_word_content(docx_file):
             current_chapter_num = 1
             previous_entry_num = None
             just_saw_explicit_marker = True
+            pending_heading = False
             continue
 
         raw_texts.append(line)
@@ -118,6 +185,12 @@ def parse_word_content(docx_file):
             current_chapter_num = 1
             previous_entry_num = None
             just_saw_explicit_marker = True
+            pending_heading = False
+            continue
+
+        # "Mastery" 같은 이름만 있는 단원 제목 (다음 단어 번호가 1이면 새 회차)
+        if is_section_heading(line):
+            pending_heading = True
             continue
 
         # 단어: 뜻 [탭/2칸 이상 공백 + Syn/Ant: 유의어] 추출
@@ -135,15 +208,16 @@ def parse_word_content(docx_file):
                     entry_num = int(entry_num_str)
                     # 번호가 정확히 1로 리셋되는 경우만 새 회차 시작으로 인정
                     # (오탈자로 인한 불규칙한 감소는 무시하여 오탐을 방지)
-                    if (use_round_reset_fallback and previous_entry_num is not None
-                            and entry_num == 1 and previous_entry_num != 1
-                            and not just_saw_explicit_marker):
+                    restarted = (previous_entry_num is not None and entry_num == 1
+                                 and previous_entry_num != 1 and not just_saw_explicit_marker)
+                    if restarted and (use_round_reset_fallback or pending_heading):
                         current_week_num += 1
                         current_week_title = f"Week {current_week_num:02d}/"
                         current_chapter_num = 1
                     previous_entry_num = entry_num
 
                 just_saw_explicit_marker = False
+                pending_heading = False
 
                 rest = match.group(3)
 
@@ -295,6 +369,8 @@ def parse_pdf_content(pdf_file):
     current_chapter_num = 1
     current_week_title = "Week 01/"
     current_week_num = 1
+    previous_entry_num = None
+    pending_heading = False
 
     # PDF 텍스트 추출 시 "01 word: 뜻   Syn: xxx" 처럼 번호가 마침표 없이
     # 붙는 형태와, 뜻과 Syn/Ant 사이가 한 칸 공백으로만 구분되는 경우가 많아
@@ -315,11 +391,26 @@ def parse_pdf_content(pdf_file):
                 current_week_num = chapter_num
                 current_week_title = f"Week {current_week_num:02d}/"
                 current_chapter_num = 1
+                previous_entry_num = None
+            pending_heading = False
+            continue
+
+        # "Mastery" 같은 이름만 있는 단원 제목 (다음 단어 번호가 1이면 새 회차)
+        if is_section_heading(line):
+            pending_heading = True
             continue
 
         # 번호 + 단어: 뜻 [Syn/Ant: 유의어] 추출
         match = entry_pattern.match(line)
         if match:
+            entry_num = int(re.match(r'^(\d{1,2})', line).group(1))
+            if pending_heading and previous_entry_num is not None and entry_num == 1 and previous_entry_num != 1:
+                current_week_num += 1
+                current_week_title = f"Week {current_week_num:02d}/"
+                current_chapter_num = 1
+            previous_entry_num = entry_num
+            pending_heading = False
+
             raw_word = expand_sb_sth(match.group(1).strip())
             rest = match.group(2).strip()
 
@@ -364,6 +455,8 @@ def parse_pdf_content_pos_style(pdf_file):
     current_chapter_num = 1
     current_week_title = "Week 01/"
     current_week_num = 1
+    previous_entry_num = None
+    pending_heading = False
 
     # 번호, 단어(구), 품사(n./v./adj./adv./prep./conj., 필요시 phr. 포함), 뜻,
     # 그리고 마지막에 붙는 단원 코드(LZ/U1/U2/TS)까지 한 줄에 모두 들어있는 형식
@@ -383,10 +476,25 @@ def parse_pdf_content_pos_style(pdf_file):
                 current_week_num = chapter_num
                 current_week_title = f"Week {current_week_num:02d}/"
                 current_chapter_num = 1
+                previous_entry_num = None
+            pending_heading = False
+            continue
+
+        # "Mastery" 같은 이름만 있는 단원 제목 (다음 단어 번호가 1이면 새 회차)
+        if is_section_heading(line):
+            pending_heading = True
             continue
 
         match = entry_pattern.match(line)
         if match:
+            entry_num = int(match.group(1))
+            if pending_heading and previous_entry_num is not None and entry_num == 1 and previous_entry_num != 1:
+                current_week_num += 1
+                current_week_title = f"Week {current_week_num:02d}/"
+                current_chapter_num = 1
+            previous_entry_num = entry_num
+            pending_heading = False
+
             raw_word = expand_sb_sth(match.group(2).strip())
             rest = match.group(4).strip()
             meaning = pos_inline_pattern.sub(", ", rest).strip(", ").strip()
@@ -482,8 +590,8 @@ import tempfile
 import subprocess
 import collections
 
-def parse_source_file(uploaded):
-    """워드/PDF를 기존 파서로 분석합니다. (탭1의 기존 동작과 동일)"""
+def parse_source_file(uploaded, week_mode="seq"):
+    """워드/PDF를 기존 파서로 분석하고, 주차 배정 방식(그대로/홀수/짝수)을 적용합니다. (탭1, 탭2 공용)"""
     file_ext = uploaded.name.lower().rsplit(".", 1)[-1]
     uploaded.seek(0)
     if file_ext == "pdf":
@@ -496,7 +604,7 @@ def parse_source_file(uploaded):
         if not parsed_data:
             uploaded.seek(0)
             parsed_data, raw_texts = parse_word_content_glossary_style(uploaded)
-    return parsed_data, raw_texts
+    return remap_weeks(parsed_data, week_mode), raw_texts
 
 
 # ==========================================================================
@@ -922,6 +1030,14 @@ with st.sidebar:
     act_name = st.text_input("act_name", "Vocab list")
     show_debug = st.checkbox("디버그 모드", value=False)
 
+    st.header("📅 주차 배정")
+    week_mode_label = st.radio(
+        "회차를 몇 주차로 넣을까요?", list(WEEK_MODES.keys()),
+        help="자동: 홀수 주 교재(" + ", ".join(ODD_WEEK_BOOKS) + "), 짝수 주 교재(" + ", ".join(EVEN_WEEK_BOOKS) + ")\n\n"
+             "홀수 주: CHAPTER 1 → W01, CHAPTER 2 → W03 …  /  짝수 주: CHAPTER 1 → W02, CHAPTER 2 → W04 …",
+    )
+    week_mode = WEEK_MODES[week_mode_label]
+
     st.header("📁 파일명 설정")
     st.caption("예: TOT_AU_Recap_S_W04_260731.xlsx")
     file_name_prefix = st.text_input("파일명 접두어 (주차/날짜 앞부분)", "TOT_AU_Recap_S")
@@ -937,7 +1053,10 @@ with tab1:
     uploaded_file = st.file_uploader("워드(.docx) 또는 PDF(.pdf) 파일을 업로드하세요", type=["docx", "pdf"], key="src_upload")
 
     if uploaded_file is not None:
-        parsed_data, raw_texts = parse_source_file(uploaded_file)
+        applied_mode, mode_note = resolve_week_mode(uploaded_file.name, week_mode)
+        if mode_note:
+            st.info("📅 " + mode_note)
+        parsed_data, raw_texts = parse_source_file(uploaded_file, applied_mode)
 
         if parsed_data:
             df = pd.DataFrame(parsed_data)
@@ -1026,7 +1145,10 @@ with tab2:
     if review_files:
         source_rows = None
         if compare_source is not None:
-            source_rows, _ = parse_source_file(compare_source)
+            src_mode, src_note = resolve_week_mode(compare_source.name, week_mode)
+            if src_note:
+                st.info("📅 원본 대조: " + src_note)
+            source_rows, _ = parse_source_file(compare_source, src_mode)
             if not source_rows:
                 st.warning("원본 파일에서 단어를 찾지 못해 원본 대조는 건너뜁니다.")
                 source_rows = None
